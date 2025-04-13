@@ -147,13 +147,13 @@ func (c *EventClient) RegisterHandler(entityType, action string, handler func(co
 }
 
 // RegisterTypedHandler registers a handler for events with a specific payload type
-func (c *EventClient) RegisterTypedHandler[T any](entityType, action string, handler func(context.Context, *messages.TypedEventMessage[T]) error) {
-	if c.consumer == nil {
+func RegisterTypedHandler[T any](client *EventClient, entityType, action string, handler func(context.Context, *messages.TypedEventMessage[T]) error) {
+	if client.consumer == nil {
 		panic("Cannot register handler: consumer not initialized")
 	}
 
 	typedHandler := consumer.NewTypedHandler(handler)
-	c.consumer.RegisterHandler(entityType, action, typedHandler)
+	client.consumer.RegisterHandler(entityType, action, typedHandler)
 }
 
 // Start starts the event client

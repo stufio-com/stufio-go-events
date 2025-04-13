@@ -84,7 +84,16 @@ func (r *SchemaRegistry) RefreshSchemas() error {
 	defer r.mu.Unlock()
 
 	r.definitions = definitions
-	r.eventSchemas = schemas
+	compiledSchemas := make(map[string]*gojsonschema.Schema)
+	for key, rawSchema := range schemas {
+		schemaLoader := gojsonschema.NewGoLoader(rawSchema)
+		compiledSchema, err := gojsonschema.NewSchema(schemaLoader)
+		if err != nil {
+			return fmt.Errorf("compiling schema for %s: %w", key, err)
+		}
+		compiledSchemas[key] = compiledSchema
+	}
+	r.eventSchemas = compiledSchemas
 	r.lastRefresh = time.Now()
 
 	log.Printf("AsyncAPI schema refreshed: %d event definitions, %d payload schemas",

@@ -42,13 +42,41 @@ func main() {
 		log.Fatalf("Failed to create output directory: %v", err)
 	}
 
-	// Initialize generator
-	generator := schema.NewGenerator(*packageName)
+	// Load schema
+	loader := schema.NewSchemaLoader()
+	var err error
+	// var loadedSchema *schema.AsyncAPISchema // Store the loaded schema - Not strictly needed here
+
+	if *asyncAPIFile != "" {
+		if *verbose {
+			fmt.Printf("Loading AsyncAPI schema from file: %s\n", *asyncAPIFile)
+		}
+		err = loader.LoadFromFile(*asyncAPIFile)
+	} else {
+		if *verbose {
+			fmt.Printf("Loading AsyncAPI schema from URL: %s\n", *asyncAPIURL)
+		}
+		err = loader.LoadFromURL(*asyncAPIURL)
+	}
+
+	if err != nil {
+		log.Fatalf("Failed to load AsyncAPI schema: %v", err)
+	}
+
+	// Get the loaded schema's components
+	schemaComponents, ok := loader.GetSchemaComponents()
+	if !ok {
+		log.Fatalf("Failed to get schema components after loading")
+	}
+
+	// Initialize generator *after* loading schema and getting components
+	generator := schema.NewGenerator(*packageName, schemaComponents.Schemas) // Pass components.Schemas
+
+	// Set verbosity and filters *after* initializing the generator
 	if *verbose {
 		generator.SetVerbose(true)
 	}
 
-	// Set filters if provided
 	if *entityTypes != "" {
 		entities := strings.Split(*entityTypes, ",")
 		for i, e := range entities {
@@ -73,30 +101,15 @@ func main() {
 		generator.SetExcludePatterns(patterns)
 	}
 
-	// Load schema
-	loader := schema.NewSchemaLoader()
-	var err error
-
-	if *asyncAPIFile != "" {
-		if *verbose {
-			fmt.Printf("Loading AsyncAPI schema from file: %s\n", *asyncAPIFile)
-		}
-		err = loader.LoadFromFile(*asyncAPIFile)
-	} else {
-		if *verbose {
-			fmt.Printf("Loading AsyncAPI schema from URL: %s\n", *asyncAPIURL)
-		}
-		err = loader.LoadFromURL(*asyncAPIURL)
-	}
-
-	if err != nil {
-		log.Fatalf("Failed to load AsyncAPI schema: %v", err)
-	}
-
-	// Extract payload schemas
+	// Extract payload schemas (now returns map[string]map[string]interface{})
 	payloadSchemas, err := loader.ExtractPayloadSchemas()
 	if err != nil {
-		log.Fatalf("Failed to extract payload schemas: %v", err)
+		// Log non-fatal errors from ExtractPayloadSchemas already, just check final error state if needed
+		log.Printf("Warning: Encountered errors during payload schema extraction: %v", err)
+		// Decide if this should be fatal or not. Let's allow continuing.
+	}
+	if len(payloadSchemas) == 0 {
+		log.Fatalf("No payload schemas were successfully extracted. Check warnings.")
 	}
 
 	// Extract event definitions
@@ -104,21 +117,28 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to extract event definitions: %v", err)
 	}
+	if len(eventDefs) == 0 {
+		log.Fatalf("No event definitions were successfully extracted. Check warnings.")
+	}
 
 	// Generate structs
 	if *verbose {
-		fmt.Printf("Generating Go structs for schemas in %s\n", *outputDir)
+		fmt.Printf("Generating Go structs for %d schemas in %s\n", len(payloadSchemas), *outputDir)
 	}
 
 	files, err := generator.GenerateStructs(payloadSchemas, eventDefs, *outputDir)
 	if err != nil {
-		log.Fatalf("Failed to generate structs: %v", err)
+		log.Fatalf("Failed to generate structs: %v", err) // This captures errors from file writing etc.
 	}
 
 	// Print summary
-	fmt.Printf("Generated %d Go files in %s:\n", len(files), *outputDir)
-	for _, file := range files {
-		fmt.Printf("  - %s\n", filepath.Base(file))
+	if len(files) > 0 {
+		fmt.Printf("Generated %d Go files in %s:\n", len(files), *outputDir)
+		for _, file := range files {
+			fmt.Printf("  - %s\n", filepath.Base(file))
+		}
+	} else {
+		fmt.Println("No Go files were generated. Check logs for warnings or errors.")
 	}
 }
 
