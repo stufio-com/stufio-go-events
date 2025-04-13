@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/nameniac/stufio-go-events/messages"
+	"github.com/stufio-com/stufio-go-events/messages"
 )
 
 // AsyncAPISchema represents an AsyncAPI schema document

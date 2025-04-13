@@ -228,12 +228,25 @@ type XDGSCRAMClient struct {
 	HashGeneratorFcn func() sarama.SCRAMClient
 }
 
-func SHA256() sarama.SCRAMClient {
-	// Placeholder
+func (c *XDGSCRAMClient) Begin(userName, password, authzID string) error {
+	// Placeholder implementation for the Begin method
 	return nil
 }
 
+func (c *XDGSCRAMClient) Step(challenge string) (string, error) {
+	// Placeholder implementation for the Step method
+	return "", nil
+}
+
+func (c *XDGSCRAMClient) Done() bool {
+	// Placeholder implementation for the Done method
+	return true
+}
+
+func SHA256() sarama.SCRAMClient {
+	return &XDGSCRAMClient{}
+}
+
 func SHA512() sarama.SCRAMClient {
-	// Placeholder
-	return nil
+	return &XDGSCRAMClient{}
 }

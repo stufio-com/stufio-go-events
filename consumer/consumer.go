@@ -10,8 +10,8 @@ import (
 	"syscall"
 
 	"github.com/IBM/sarama"
-	"github.com/nameniac/stufio-go-events/config"
-	"github.com/nameniac/stufio-go-events/messages"
+	"github.com/stufio-com/stufio-go-events/config"
+	"github.com/stufio-com/stufio-go-events/messages"
 )
 
 // EventHandler defines the interface for handling event messages

@@ -6,7 +6,7 @@ import (
 	"log"
 
 	"github.com/IBM/sarama"
-	"github.com/nameniac/stufio-go-events/messages"
+	"github.com/stufio-com/stufio-go-events/messages"
 )
 
 // BasicEventHandler provides a simple implementation of EventHandler
