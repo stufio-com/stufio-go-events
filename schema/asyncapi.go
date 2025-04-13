@@ -189,73 +189,177 @@ func (l *SchemaLoader) ExtractEventDefinitions() ([]messages.EventDefinition, er
 // ExtractPayloadSchemas extracts payload schemas from the schema
 // Returns a map of "entityType.action" to the *resolved* raw payload schema map.
 func (l *SchemaLoader) ExtractPayloadSchemas() (map[string]map[string]interface{}, error) {
+	schemaMaps, _, err := l.ExtractPayloadSchemasAndRefs()
+	return schemaMaps, err
+}
+
+// ExtractPayloadSchemasAndRefs extracts payload schemas and their original $ref strings.
+// Returns:
+// 1. map[string]map[string]interface{}: "entityType.action" -> resolved raw payload schema map.
+// 2. map[string]string: "entityType.action" -> CORRECTED $ref string (e.g., "#/components/schemas/MyPayload").
+// 3. error: Any error encountered during extraction.
+func (l *SchemaLoader) ExtractPayloadSchemasAndRefs() (map[string]map[string]interface{}, map[string]string, error) {
 	if l.schema == nil {
-		return nil, fmt.Errorf("no schema loaded")
+		return nil, nil, fmt.Errorf("no schema loaded")
 	}
 
-	// Change the map type to store raw schema maps instead of compiled schemas
-	schemas := make(map[string]map[string]interface{})
+	schemaMaps := make(map[string]map[string]interface{})
+	schemaRefs := make(map[string]string) // Map to store CORRECTED refs
 
-	// Process each channel
 	for channelName, channel := range l.schema.Channels {
-		// Try to extract entity type and action from channel name (expecting nameniac.events.entity.action)
 		parts := strings.Split(channelName, ".")
-		if len(parts) != 4 { // Expecting 4 parts
-			log.Printf("Warning: Skipping channel with unexpected name format: %s", channelName)
-			continue // Skip channels without proper naming
+		if len(parts) != 4 {
+			log.Printf("Skipping channel '%s': Name does not match expected format '_.events.entity.action'", channelName)
+			continue
 		}
+		entityType := parts[2]
+		action := parts[3]
+		key := fmt.Sprintf("%s.%s", entityType, action)
 
-		entityType := parts[2]                          // Use 3rd part
-		action := parts[3]                              // Use 4th part
-		key := fmt.Sprintf("%s.%s", entityType, action) // e.g., "user.created"
-
-		// Get the message definition ($ref or inline)
 		var messageDef *Message
+		var operationDesc string // To potentially get description
+
+		// Check publish and subscribe operations for the message
 		if channel.Publish != nil && channel.Publish.Message != nil {
 			messageDef = channel.Publish.Message
+			operationDesc = channel.Publish.Description
 		} else if channel.Subscribe != nil && channel.Subscribe.Message != nil {
 			messageDef = channel.Subscribe.Message
+			operationDesc = channel.Subscribe.Description
 		} else {
-			continue // No message definition
-		}
-
-		// Get the payload definition from the message
-		payloadDefinition := messageDef.Payload
-		if payloadDefinition == nil {
-			log.Printf("Warning: No payload definition found for message in channel %s", channelName)
+			log.Printf("Warning: No message definition found for channel %s", channelName)
 			continue
 		}
 
-		// Extract the *actual* payload schema reference (e.g., #/components/schemas/UserCreatedPayload)
-		actualPayloadSchemaRef, err := l.extractActualPayloadSchemaRef(payloadDefinition)
-		if err != nil {
-			log.Printf("Warning: Could not extract actual payload schema ref for %s (%s): %v", key, channelName, err)
-			continue
-		}
-
-		// Resolve this reference to the actual schema definition map
-		resolvedPayloadSchema, err := l.resolveSchemaRef(map[string]interface{}{"$ref": actualPayloadSchemaRef})
-		if err != nil {
-			log.Printf("Warning: Could not resolve actual payload schema %s for %s (%s): %v", actualPayloadSchemaRef, key, channelName, err)
-			continue
-		}
-
-		// Store the resolved schema map (compilation will happen later if needed, e.g., for validation)
-		schemas[key] = resolvedPayloadSchema
-
-		// Optional: Compile here for immediate validation feedback during generation (uncomment if needed)
-		/*
-			loader := gojsonschema.NewGoLoader(resolvedPayloadSchema)
-			_, err = gojsonschema.NewSchema(loader)
-			if err != nil {
-				rawJSON, _ := json.MarshalIndent(resolvedPayloadSchema, "", "  ")
-				log.Printf("Error compiling schema for %s: %v\nSchema:\n%s", key, err, string(rawJSON))
-				continue // Skip schema if compilation fails
+		// Handle message reference (e.g., $ref: '#/components/messages/UserCreated')
+		if msgRef, ok := messageDef.Payload["$ref"].(string); ok {
+			if !strings.HasPrefix(msgRef, "#/components/messages/") {
+				log.Printf("Warning: Unsupported message reference format '%s' in channel %s", msgRef, channelName)
+				continue
 			}
-		*/
+			msgName := strings.TrimPrefix(msgRef, "#/components/messages/")
+			if compMsg, found := l.schema.Components.Messages[msgName]; found {
+				messageDef = &compMsg // Point to the component message
+			} else {
+				log.Printf("Warning: Message reference '%s' not found in components for channel %s", msgRef, channelName)
+				continue
+			}
+		}
+
+		// Now get the payload definition from the resolved messageDef
+		if messageDef.Payload == nil {
+			log.Printf("Warning: No payload definition found for message in channel %s", channelName)
+			continue // Skip if no payload defined
+		}
+
+		// --- Get the ORIGINAL payload $ref ---
+		originalPayloadRef, ok := messageDef.Payload["$ref"].(string)
+		if !ok {
+			log.Printf("Warning: Payload for %s is not a $ref, cannot process.", key)
+			continue
+		}
+
+		// --- PARSE the original ref to get the ACTUAL payload schema name ---
+		actualSchemaName, err := parseActualSchemaName(originalPayloadRef)
+		if err != nil {
+			log.Printf("Warning: Could not parse actual schema name from ref '%s' for %s: %v", originalPayloadRef, key, err)
+			continue
+		}
+
+		// --- Construct the CORRECTED reference string ---
+		correctedRef := fmt.Sprintf("#/components/schemas/%s", actualSchemaName)
+		schemaRefs[key] = correctedRef // Store the CORRECTED ref
+
+		// --- Resolve the ref using the CORRECTED ref string ---
+		// Create a temporary map with the corrected ref to pass to resolveSchemaRef
+		tempSchemaDef := map[string]interface{}{"$ref": correctedRef}
+		resolvedPayloadSchema, err := l.resolveSchemaRef(tempSchemaDef) // Use existing resolve function with corrected ref
+		if err != nil {
+			log.Printf("Warning: Could not resolve corrected payload schema ref '%s' for %s: %v", correctedRef, key, err)
+			continue
+		}
+
+		// Add description if missing in the resolved schema, using message or operation description
+		if _, descExists := resolvedPayloadSchema["description"]; !descExists {
+			desc := messageDef.Description
+			if desc == "" {
+				desc = operationDesc
+			}
+			if desc != "" {
+				// Use the actual schema name for the description title
+				resolvedPayloadSchema["description"] = fmt.Sprintf("%s: %s", pascalCase(actualSchemaName), desc)
+			}
+		}
+
+		schemaMaps[key] = resolvedPayloadSchema // Store the resolved map
 	}
 
-	return schemas, nil
+	return schemaMaps, schemaRefs, nil // Return maps (schemaMaps contains resolved, schemaRefs contains corrected refs)
+}
+
+// --- Add a helper function to parse the actual schema name ---
+// Parses "BaseEventMessage[ActualName]" or "ActualName" from a ref like "#/components/schemas/..."
+func parseActualSchemaName(ref string) (string, error) {
+	if !strings.HasPrefix(ref, "#/components/schemas/") {
+		return "", fmt.Errorf("ref does not start with #/components/schemas/")
+	}
+	namePart := strings.TrimPrefix(ref, "#/components/schemas/")
+
+	// Check for BaseEventMessage[ActualName] pattern
+	if strings.HasPrefix(namePart, "BaseEventMessage[") && strings.HasSuffix(namePart, "]") {
+		innerName := strings.TrimPrefix(namePart, "BaseEventMessage[")
+		innerName = strings.TrimSuffix(innerName, "]")
+		if innerName == "" {
+			return "", fmt.Errorf("invalid BaseEventMessage pattern, empty inner name in ref: %s", ref)
+		}
+		return innerName, nil
+	}
+	// Otherwise, assume the name part is the actual schema name
+	if namePart == "" {
+		return "", fmt.Errorf("empty schema name in ref: %s", ref)
+	}
+	return namePart, nil
+}
+
+// Update resolveSchemaRef to handle only direct schema names from components
+func (l *SchemaLoader) resolveSchemaRef(schemaDef map[string]interface{}) (map[string]interface{}, error) {
+	if schemaDef == nil {
+		return nil, fmt.Errorf("schema definition is nil")
+	}
+
+	ref, ok := schemaDef["$ref"].(string)
+	if !ok {
+		// If not a ref, assume it's an inline schema. Return it as is.
+		// The caller (ExtractPayloadSchemasAndRefs) should handle adding descriptions etc.
+		// The generator needs to handle inline object definitions separately if needed.
+		log.Printf("DEBUG: resolveSchemaRef found inline schema (not a $ref): %v", schemaDef)
+		return schemaDef, nil
+	}
+
+	// Use the new parser function here as well for consistency, although
+	// ExtractPayloadSchemasAndRefs should already pass the corrected ref.
+	actualSchemaName, err := parseActualSchemaName(ref)
+	if err != nil {
+		return nil, fmt.Errorf("resolving ref '%s': %w", ref, err)
+	}
+
+	// Look up in components
+	if l.schema == nil || l.schema.Components.Schemas == nil {
+		return nil, fmt.Errorf("schema or components not loaded")
+	}
+
+	componentSchema, found := l.schema.Components.Schemas[actualSchemaName]
+	if !found {
+		return nil, fmt.Errorf("schema '%s' not found in components (from ref '%s')", actualSchemaName, ref)
+	}
+
+	componentSchemaMap, ok := componentSchema.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("component schema '%s' is not a valid map[string]interface{}", actualSchemaName)
+	}
+
+	// Return the raw map.
+	return componentSchemaMap, nil
 }
 
 // extractPayloadSchema processes a payload definition to make it a valid JSON Schema
@@ -338,50 +442,6 @@ func (l *SchemaLoader) extractActualPayloadSchemaRef(payloadDef map[string]inter
 
 	// Otherwise, assume the ref points directly to the payload schema
 	return refToCheck, nil
-}
-
-// Update resolveSchemaRef to handle only direct schema names from components
-func (l *SchemaLoader) resolveSchemaRef(schemaDef map[string]interface{}) (map[string]interface{}, error) {
-	if schemaDef == nil {
-		return nil, fmt.Errorf("schema definition is nil")
-	}
-
-	ref, ok := schemaDef["$ref"].(string)
-	if !ok {
-		// If not a ref, assume it's an inline schema. Add basic validation/defaults.
-		return extractPayloadSchema(schemaDef)
-	}
-
-	// Basic $ref parsing (expecting #/components/schemas/ActualSchemaName)
-	if !strings.HasPrefix(ref, "#/components/schemas/") {
-		return nil, fmt.Errorf("unsupported or unexpected $ref format: %s", ref)
-	}
-
-	schemaName := strings.TrimPrefix(ref, "#/components/schemas/")
-
-	// Ensure no BaseEventMessage[...] pattern remains here
-	if strings.Contains(schemaName, "[") {
-		return nil, fmt.Errorf("resolveSchemaRef received unexpected parameterized ref: %s", schemaName)
-	}
-
-	// Look up in components
-	if l.schema == nil || l.schema.Components.Schemas == nil {
-		return nil, fmt.Errorf("schema or components section not loaded/present")
-	}
-
-	componentSchema, found := l.schema.Components.Schemas[schemaName]
-	if !found {
-		return nil, fmt.Errorf("referenced schema not found in components: %s", schemaName)
-	}
-
-	componentSchemaMap, ok := componentSchema.(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("component schema '%s' is not a valid object", schemaName)
-	}
-
-	// Return the raw map. The generator will process this.
-	// We might need to recursively resolve internal $refs within this map later if the generator needs it.
-	return componentSchemaMap, nil
 }
 
 // GetSchemaComponents returns the Components part of the loaded schema.

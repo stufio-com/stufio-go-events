@@ -493,45 +493,52 @@ func (g *Generator) jsonSchemaToGoType(schema map[string]interface{}) (string, m
 
 	// Handle references first
 	if ref, ok := schema["$ref"].(string); ok {
+		// Resolve the ref to the Go type name using the updated function
 		typeName, err := g.resolveRefToTypeName(ref)
 		if err != nil {
-			log.Printf("Warning: Failed to resolve $ref '%s' to type name: %v", ref, err)
-			return "interface{}", imports // Fallback for unresolved refs
+			log.Printf("Warning: Failed to resolve ref '%s': %v. Using 'interface{}'.", ref, err)
+			return "interface{}", imports // Fallback to interface{} on error
 		}
 
-		// Check if the resolved type itself needs imports or needs generation (e.g., enum)
-		resolvedSchema, lookupErr := g.lookupComponentSchema(ref)
-		if lookupErr == nil {
-			// Check if it's an enum that needs its own type generated
-			if schemaType, ok := resolvedSchema["type"].(string); ok && schemaType == "string" {
-				if _, hasEnum := resolvedSchema["enum"]; hasEnum {
-					// It's an enum, mark it for generation if not already done
-					if _, exists := g.enumsToGenerate[typeName]; !exists {
-						g.enumsToGenerate[typeName] = resolvedSchema
-						if g.verbose {
-							log.Printf("Detected enum '%s' for generation.", typeName)
-						}
-					}
-					// The type name remains the PascalCase name (e.g., Domainstatus)
-					return typeName, imports
-				}
-			}
-
-			// Check for time.Time specifically based on format
-			if schemaType, ok := resolvedSchema["type"].(string); ok && schemaType == "string" {
-				if format, ok := resolvedSchema["format"].(string); ok {
-					if format == "date-time" || format == "date" {
-						imports["time"] = true
-						return "time.Time", imports
-					}
-				}
-			}
-			// Add checks for other simple types needing generation if necessary
-		} else {
-			log.Printf("Warning: Could not look up schema for $ref '%s': %v", ref, lookupErr)
+		// Check if the resolved type is an enum we need to generate
+		if _, isEnum := g.enumsToGenerate[typeName]; isEnum {
+			// It's an enum, return the type name (it will be generated later)
+			return typeName, imports
 		}
 
-		// Return the resolved type name (e.g., UserCreatedPayload, Domainstatus)
+		// Check if the resolved type is a known primitive or special type (like time.Time)
+		// This requires looking up the actual schema definition for the ref.
+		refSchema, err := g.lookupComponentSchema(ref) // Use existing lookup
+		if err != nil {
+			log.Printf("Warning: Could not look up schema for ref '%s': %v. Assuming object type.", ref, err)
+			// Assume it's a struct to be generated if lookup fails
+			g.generatedTypes[typeName] = true // Mark for potential generation
+			return typeName, imports
+		}
+
+		// Determine the type of the referenced schema
+		refSchemaType, _ := refSchema["type"].(string)
+		refSchemaFormat, _ := refSchema["format"].(string)
+
+		if refSchemaType == "string" && refSchemaFormat == "date-time" {
+			imports["time"] = true
+			return "time.Time", imports
+		}
+		if refSchemaType == "string" && len(refSchema["enum"].([]interface{})) > 0 {
+			// It's an enum defined by ref, ensure it's marked for generation
+			g.enumsToGenerate[typeName] = refSchema
+			return typeName, imports
+		}
+		if refSchemaType != "object" && refSchemaType != "" { // If it's a primitive type by reference
+			primitiveType, primitiveImports := g.jsonSchemaToGoType(refSchema) // Recurse for primitives/arrays
+			for imp := range primitiveImports {
+				imports[imp] = true
+			}
+			return primitiveType, imports
+		}
+
+		// Otherwise, assume it's an object/struct type
+		g.generatedTypes[typeName] = true // Mark for generation
 		return typeName, imports
 	}
 
@@ -666,15 +673,24 @@ func (g *Generator) jsonSchemaToGoType(schema map[string]interface{}) (string, m
 
 // Add helper to resolve $ref to type name
 func (g *Generator) resolveRefToTypeName(ref string) (string, error) {
-	if !strings.HasPrefix(ref, "#/components/schemas/") {
-		return "", fmt.Errorf("unsupported $ref format for type resolution: %s", ref)
+	// Use the same parser as in asyncapi.go
+	actualSchemaName, err := parseActualSchemaName(ref) // Assuming parseActualSchemaName is accessible or duplicated here
+	if err != nil {
+		return "", fmt.Errorf("parsing ref '%s': %w", ref, err)
 	}
-	schemaName := strings.TrimPrefix(ref, "#/components/schemas/")
 
 	// Convert schema name (e.g., UserCreatedPayload) to Go type name (e.g., UserCreatedPayload)
-	// Assumes the referenced schema will also be generated as a struct if it's an object type.
-	return pascalCase(schemaName), nil
+	typeName := pascalCase(actualSchemaName) // Use existing helper
+
+	// Check if the referenced type itself needs generation (if it's an object)
+	// This logic might be better placed within jsonSchemaToGoType when handling the $ref
+	// For now, just return the PascalCase name.
+	return typeName, nil
 }
+
+// --- Add or ensure parseActualSchemaName is available ---
+// Parses "BaseEventMessage[ActualName]" or "ActualName" from a ref like "#/components/schemas/..."
+// Removed duplicate parseActualSchemaName function to avoid redeclaration error.
 
 // Add helper to look up the actual schema definition from components
 func (g *Generator) lookupComponentSchema(ref string) (map[string]interface{}, error) {
