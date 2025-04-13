@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/stufio-com/stufio-go-events/messages"
+	"github.com/xeipuuv/gojsonschema"
 )
 
 // AsyncAPISchema represents an AsyncAPI schema document
@@ -183,6 +184,89 @@ func (l *SchemaLoader) ExtractEventDefinitions() ([]messages.EventDefinition, er
 	}
 
 	return definitions, nil
+}
+
+// ExtractPayloadSchemas extracts payload schemas from the schema
+func (l *SchemaLoader) ExtractPayloadSchemas() (map[string]*gojsonschema.Schema, error) {
+	if l.schema == nil {
+		return nil, fmt.Errorf("no schema loaded")
+	}
+
+	schemas := make(map[string]*gojsonschema.Schema)
+
+	// Process each channel
+	for channelName, channel := range l.schema.Channels {
+		// Try to extract entity type and action from channel name
+		parts := strings.Split(channelName, ".")
+		if len(parts) < 2 {
+			continue // Skip channels without proper naming
+		}
+
+		entityType := parts[0]
+		action := parts[1]
+		key := fmt.Sprintf("%s.%s", entityType, action)
+
+		// Extract payload schema from publish operation
+		if channel.Publish != nil && channel.Publish.Message != nil {
+			payloadSchema, err := extractPayloadSchema(channel.Publish.Message.Payload)
+			if err != nil {
+				return nil, fmt.Errorf("extracting payload schema for %s: %w", key, err)
+			}
+
+			// Compile schema for validation
+			loader := gojsonschema.NewGoLoader(payloadSchema)
+			schema, err := gojsonschema.NewSchema(loader)
+			if err != nil {
+				return nil, fmt.Errorf("compiling schema for %s: %w", key, err)
+			}
+
+			schemas[key] = schema
+		}
+
+		// Extract payload schema from subscribe operation
+		if channel.Subscribe != nil && channel.Subscribe.Message != nil {
+			payloadSchema, err := extractPayloadSchema(channel.Subscribe.Message.Payload)
+			if err != nil {
+				return nil, fmt.Errorf("extracting payload schema for %s: %w", key, err)
+			}
+
+			// Compile schema for validation
+			loader := gojsonschema.NewGoLoader(payloadSchema)
+			schema, err := gojsonschema.NewSchema(loader)
+			if err != nil {
+				return nil, fmt.Errorf("compiling schema for %s: %w", key, err)
+			}
+
+			schemas[key] = schema
+		}
+	}
+
+	return schemas, nil
+}
+
+// extractPayloadSchema processes a payload definition to make it a valid JSON Schema
+func extractPayloadSchema(payload map[string]interface{}) (map[string]interface{}, error) {
+	if payload == nil {
+		return nil, fmt.Errorf("missing payload schema")
+	}
+
+	// Ensure schema has required JSON Schema fields
+	schema := make(map[string]interface{})
+	for k, v := range payload {
+		schema[k] = v
+	}
+
+	// Add $schema if missing
+	if _, exists := schema["$schema"]; !exists {
+		schema["$schema"] = "http://json-schema.org/draft-07/schema#"
+	}
+
+	// Add type if missing
+	if _, exists := schema["type"]; !exists {
+		schema["type"] = "object"
+	}
+
+	return schema, nil
 }
 
 // Helper functions to extract information from the schema

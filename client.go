@@ -10,33 +10,53 @@ import (
 	"github.com/stufio-com/stufio-go-events/consumer"
 	"github.com/stufio-com/stufio-go-events/messages"
 	"github.com/stufio-com/stufio-go-events/producer"
+	"github.com/stufio-com/stufio-go-events/schema"
 )
 
-// EventClient provides a unified client for producing and consuming events
+// EventClient provides a high-level interface to the events system
 type EventClient struct {
-	Producer *producer.EventProducer
-	Consumer *consumer.EventConsumer
-	Config   *config.KafkaConfig
+	producer       *producer.EventProducer
+	consumer       *consumer.EventConsumer
+	config         *config.EventsConfig
+	schemaRegistry *schema.SchemaRegistry
 }
 
 // NewEventClient creates a new event client
-func NewEventClient(cfg *config.KafkaConfig) (*EventClient, error) {
+func NewEventClient(kafkaConfig *config.KafkaConfig) (*EventClient, error) {
+	// Create default events config
+	eventsConfig := config.DefaultEventsConfig()
+	eventsConfig.Kafka = kafkaConfig
+
+	return NewEventClientWithConfig(eventsConfig)
+}
+
+// NewEventClientWithConfig creates an event client with a specified config
+func NewEventClientWithConfig(config *config.EventsConfig) (*EventClient, error) {
+	// Initialize schema registry
+	schema.InitGlobalRegistry(config.AsyncAPIURL, config.SchemaRefreshTime, config.SchemaValidation)
+	schemaRegistry := schema.GetGlobalRegistry()
+
 	// Create producer
-	prod, err := producer.NewEventProducer(cfg)
+	prod, err := producer.NewEventProducer(config.Kafka)
 	if err != nil {
-		return nil, fmt.Errorf("creating producer: %w", err)
+		return nil, fmt.Errorf("creating event producer: %w", err)
 	}
 
-	// Create consumer
-	cons, err := consumer.NewEventConsumer(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("creating consumer: %w", err)
+	// Create consumer if topics are specified
+	var cons *consumer.EventConsumer
+	if len(config.Kafka.Topics) > 0 {
+		cons, err = consumer.NewEventConsumer(config.Kafka)
+		if err != nil {
+			prod.Close() // Clean up producer if consumer creation fails
+			return nil, fmt.Errorf("creating event consumer: %w", err)
+		}
 	}
 
 	return &EventClient{
-		Producer: prod,
-		Consumer: cons,
-		Config:   cfg,
+		producer:       prod,
+		consumer:       cons,
+		config:         config,
+		schemaRegistry: schemaRegistry,
 	}, nil
 }
 
@@ -63,23 +83,31 @@ type Actor struct {
 	ID   string
 }
 
-// PublishEvent is a convenience method for publishing events
+// PublishEvent publishes an event
 func (c *EventClient) PublishEvent(
-	topic string,
+	topicName string,
 	entity Entity,
 	action string,
 	actor Actor,
 	payload interface{},
-	eventID string,
+	correlationID string,
 ) error {
-	if eventID == "" {
-		eventID = uuid.New().String()
+	// Validate payload against schema
+	if err := c.schemaRegistry.ValidatePayload(entity.Type, action, payload); err != nil {
+		return fmt.Errorf("payload validation failed: %w", err)
 	}
 
 	// Create base event message
+	eventID := uuid.New().String()
+	correlID := &correlationID
+	if correlationID == "" {
+		correlID = nil
+	}
+
 	eventMsg := &messages.BaseEventMessage{
-		EventID:   eventID,
-		Timestamp: time.Now().UTC(),
+		EventID:       eventID,
+		CorrelationID: correlID,
+		Timestamp:     time.Now(),
 		Entity: messages.Entity{
 			Type: entity.Type,
 			ID:   entity.ID,
@@ -92,81 +120,66 @@ func (c *EventClient) PublishEvent(
 		Payload: payload,
 	}
 
-	return c.Producer.Publish(topic, eventMsg)
+	// Get topic from registry if not specified directly
+	topic := topicName
+	if topic == "" {
+		if eventDef, found := c.schemaRegistry.GetEventDefinition(entity.Type, action); found {
+			topic = eventDef.Topic
+		}
+	}
+
+	if topic == "" {
+		return fmt.Errorf("no topic found for %s.%s", entity.Type, action)
+	}
+
+	// Publish message
+	return c.producer.Publish(topic, eventMsg)
 }
 
-// RegisterHandler registers a handler for a specific event type
-func (c *EventClient) RegisterHandler(entityType string, action string, handler func(context.Context, *Event) error) {
-	c.Consumer.RegisterHandler(entityType, action, consumer.NewBasicHandler(
-		func(ctx context.Context, msg *messages.BaseEventMessage) error {
-			event := &Event{
-				EventID:       msg.EventID,
-				CorrelationID: msg.CorrelationID,
-				Entity: Entity{
-					Type: msg.Entity.Type,
-					ID:   msg.Entity.ID,
-				},
-				Action: msg.Action,
-				Actor: Actor{
-					Type: string(msg.Actor.Type),
-					ID:   msg.Actor.ID,
-				},
-				Payload:   msg.Payload,
-				Timestamp: msg.Timestamp,
-			}
-			return handler(ctx, event)
-		},
-	))
+// RegisterHandler registers an event handler for a specific event type
+func (c *EventClient) RegisterHandler(entityType, action string, handler func(context.Context, *messages.BaseEventMessage) error) {
+	if c.consumer == nil {
+		panic("Cannot register handler: consumer not initialized")
+	}
+
+	basicHandler := consumer.NewBasicHandler(handler)
+	c.consumer.RegisterHandler(entityType, action, basicHandler)
 }
 
-// RegisterTopicHandler registers a handler for all events on a topic
-func (c *EventClient) RegisterTopicHandler(topic string, handler func(context.Context, *Event) error) {
-	c.Consumer.RegisterTopicHandler(topic, consumer.NewBasicHandler(
-		func(ctx context.Context, msg *messages.BaseEventMessage) error {
-			event := &Event{
-				EventID:       msg.EventID,
-				CorrelationID: msg.CorrelationID,
-				Entity: Entity{
-					Type: msg.Entity.Type,
-					ID:   msg.Entity.ID,
-				},
-				Action: msg.Action,
-				Actor: Actor{
-					Type: string(msg.Actor.Type),
-					ID:   msg.Actor.ID,
-				},
-				Payload:   msg.Payload,
-				Timestamp: msg.Timestamp,
-			}
-			return handler(ctx, event)
-		},
-	))
+// RegisterTypedHandler registers a handler for events with a specific payload type
+func (c *EventClient) RegisterTypedHandler[T any](entityType, action string, handler func(context.Context, *messages.TypedEventMessage[T]) error) {
+	if c.consumer == nil {
+		panic("Cannot register handler: consumer not initialized")
+	}
+
+	typedHandler := consumer.NewTypedHandler(handler)
+	c.consumer.RegisterHandler(entityType, action, typedHandler)
 }
 
-// Start starts the consumer
+// Start starts the event client
 func (c *EventClient) Start(ctx context.Context) error {
-	return c.Consumer.Start(ctx)
+	if c.consumer == nil {
+		// No consumer to start
+		return nil
+	}
+
+	return c.consumer.Start(ctx)
 }
 
-// Close closes both producer and consumer
+// Close cleans up resources
 func (c *EventClient) Close() error {
-	var prodErr, consErr error
+	var producerErr, consumerErr error
 
-	if c.Producer != nil {
-		prodErr = c.Producer.Close()
+	if c.producer != nil {
+		producerErr = c.producer.Close()
 	}
 
-	if c.Consumer != nil {
-		consErr = c.Consumer.Stop()
+	if c.consumer != nil {
+		consumerErr = c.consumer.Stop()
 	}
 
-	if prodErr != nil {
-		return fmt.Errorf("closing producer: %w", prodErr)
+	if producerErr != nil {
+		return producerErr
 	}
-
-	if consErr != nil {
-		return fmt.Errorf("closing consumer: %w", consErr)
-	}
-
-	return nil
+	return consumerErr
 }
