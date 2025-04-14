@@ -136,12 +136,16 @@ func main() {
 	// The generator should handle missing refs gracefully.
 
 	// Extract event definitions - Pass the determined topic prefix
-	eventDefs, err := loader.ExtractEventDefinitions(topicPrefix) // <-- Pass determined prefix
+	// Update to get messageSchemaRefs as well
+	eventDefs, messageSchemaRefs, err := loader.ExtractEventDefinitions(topicPrefix) // <-- Pass determined prefix, get messageSchemaRefs
 	if err != nil {
 		log.Fatalf("Failed to extract event definitions: %v", err)
 	}
 	if len(eventDefs) == 0 {
 		log.Fatalf("No event definitions were successfully extracted. Check warnings.")
+	}
+	if *verbose && len(messageSchemaRefs) > 0 {
+		log.Printf("DEBUG: Found %d message schema references.", len(messageSchemaRefs))
 	}
 
 	// Generate structs
@@ -150,8 +154,8 @@ func main() {
 		fmt.Printf("Generating Go structs based on %d event definitions in %s\n", len(eventDefs), *outputDir)
 	}
 
-	// Pass the full component schemas and the map of payload references
-	files, err := generator.GenerateStructs(schemaComponents.Schemas, payloadRefs, eventDefs, *outputDir)
+	// Pass the full component schemas, payload refs, AND message schema refs
+	files, err := generator.GenerateStructs(schemaComponents.Schemas, payloadRefs, messageSchemaRefs, eventDefs, *outputDir) // <-- Add messageSchemaRefs
 	if err != nil {
 		log.Fatalf("Failed to generate structs: %v", err) // This captures errors from file writing etc.
 	}

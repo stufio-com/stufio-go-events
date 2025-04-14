@@ -135,7 +135,7 @@ func (g *Generator) shouldIncludeEvent(entityType, action string) bool {
 
 // GenerateStructs generates Go structs from the provided schemas
 // Updated signature to accept allSchemas and payloadRefs
-func (g *Generator) GenerateStructs(allSchemas map[string]interface{}, payloadRefs map[string]string, eventDefs []messages.EventDefinition, outputDir string) ([]string, error) {
+func (g *Generator) GenerateStructs(allSchemas map[string]interface{}, payloadRefs map[string]string, messageSchemaRefs map[string]string, eventDefs []messages.EventDefinition, outputDir string) ([]string, error) {
 	var files []string
 	g.generatedTypes = make(map[string]bool)                    // Reset generated types tracker
 	g.enumsToGenerate = make(map[string]map[string]interface{}) // Reset enums tracker
@@ -180,7 +180,7 @@ func (g *Generator) GenerateStructs(allSchemas map[string]interface{}, payloadRe
 
 		// Generate the file for this entity, passing the relevant event definitions
 		// and the necessary maps for schema lookup
-		fileName, err := g.generateEntityFile(entityType, entityEventDefs, allSchemas, payloadRefs, outputDir)
+		fileName, err := g.generateEntityFile(entityType, entityEventDefs, allSchemas, payloadRefs, messageSchemaRefs, outputDir)
 		if err != nil {
 			// Log error but continue with other entities
 			log.Printf("Error generating entity file for %s: %v", entityType, err)
@@ -268,16 +268,21 @@ func (g *Generator) generateEventTypes(events []messages.EventDefinition, output
 
 // generateEntityFile generates a file for an entity with all its event payloads
 // Updated signature to accept necessary maps
-func (g *Generator) generateEntityFile(entityType string, entityEventDefs []messages.EventDefinition, allSchemas map[string]interface{}, payloadRefs map[string]string, outputDir string) (string, error) {
+func (g *Generator) generateEntityFile(entityType string, entityEventDefs []messages.EventDefinition, allSchemas map[string]interface{}, payloadRefs map[string]string, messageSchemaRefs map[string]string, outputDir string) (string, error) {
 	// Reset imports for this file
 	g.imports = make(map[string]bool)
 
 	structs := []string{}
 	imports := []string{}
+	payloadStructNames := make(map[string]string) // <-- DECLARE THE MAP HERE
 
+	// --- Step 1: Generate Payload Structs --- // <-- Renamed comment for clarity
 	// Iterate through the event definitions for this entity
 	for _, eventDef := range entityEventDefs {
 		payloadRef, refExists := payloadRefs[eventDef.Name]
+		structName := pascalCase(eventDef.Action) + "Payload" // Consistent naming
+		payloadStructNames[eventDef.Name] = structName        // Store the name for later use
+
 		if !refExists {
 			if g.verbose {
 				log.Printf("No payload reference found for event %s, generating empty struct.", eventDef.Name)
@@ -327,6 +332,65 @@ func (g *Generator) generateEntityFile(entityType string, entityEventDefs []mess
 			g.imports[imp] = true
 		}
 	}
+
+	// --- Step 2: Generate Message Structs ---
+	log.Printf("DEBUG [%s]: Starting Step 2: Generate Message Structs", entityType) // <-- Add Log
+	for _, eventDef := range entityEventDefs {
+		messageSchemaRef, refExists := messageSchemaRefs[eventDef.Name]
+		messageStructName := pascalCase(entityType) + pascalCase(eventDef.Action) + "Message"                             // e.g., DomainAnalysisRequestedMessage
+		log.Printf("DEBUG [%s]: Processing event %s for message struct %s", entityType, eventDef.Name, messageStructName) // <-- Add Log
+
+		if !refExists {
+			log.Printf("DEBUG [%s]: No message schema reference found for event %s. Skipping message struct.", entityType, eventDef.Name) // <-- Add Log
+			// log.Printf("Warning: No message schema reference found for event %s. Cannot generate specific message struct %s.", eventDef.Name, messageStructName) // Original Warning
+			continue // Cannot generate without the schema ref
+		}
+		log.Printf("DEBUG [%s]: Found message schema ref for %s: %s", entityType, eventDef.Name, messageSchemaRef) // <-- Add Log
+
+		// Message schema ref is like "#/components/schemas/BaseEventMessage[DomainAnalysisRequestPayload]"
+		// We need the schema definition itself from allSchemas
+		messageSchemaKey := strings.TrimPrefix(messageSchemaRef, "#/components/schemas/")
+		log.Printf("DEBUG [%s]: Looking up message schema key '%s' in allSchemas for %s", entityType, messageSchemaKey, eventDef.Name) // <-- Add Log
+		messageSchemaData, schemaExists := allSchemas[messageSchemaKey]
+		if !schemaExists {
+			log.Printf("DEBUG [%s]: Message schema definition '%s' NOT FOUND in allSchemas for %s. Skipping message struct.", entityType, messageSchemaKey, eventDef.Name) // <-- Add Log
+			// log.Printf("Warning: Message schema definition '%s' (from ref '%s' for event '%s') not found in components. Cannot generate specific message struct %s.", messageSchemaKey, messageSchemaRef, eventDef.Name, messageStructName) // Original Warning
+			continue
+		}
+		log.Printf("DEBUG [%s]: Found message schema definition for key '%s'", entityType, messageSchemaKey) // <-- Add Log
+
+		messageSchemaMap, ok := messageSchemaData.(map[string]interface{})
+		if !ok {
+			log.Printf("DEBUG [%s]: Message schema definition '%s' for event %s is not a valid map. Skipping message struct.", entityType, messageSchemaKey, eventDef.Name) // <-- Add Log
+			// log.Printf("Warning: Message schema definition '%s' for event %s is not a valid map structure. Cannot generate specific message struct %s.", messageSchemaKey, eventDef.Name, messageStructName) // Original Warning
+			continue
+		}
+		log.Printf("DEBUG [%s]: Message schema definition for key '%s' is a valid map.", entityType, messageSchemaKey) // <-- Add Log
+
+		// Get the name of the payload struct we generated in Step 1
+		payloadStructName := payloadStructNames[eventDef.Name]
+		if payloadStructName == "" {
+			log.Printf("DEBUG [%s]: Could not find payload struct name for event %s in payloadStructNames map. Skipping message struct.", entityType, eventDef.Name) // <-- Add Log
+			// log.Printf("Warning: Could not find payload struct name for event %s. Cannot generate specific message struct %s.", eventDef.Name, messageStructName) // Original Warning
+			continue // Should not happen if Step 1 worked
+		}
+		log.Printf("DEBUG [%s]: Found corresponding payload struct name: %s", entityType, payloadStructName) // <-- Add Log
+
+		// Generate the message struct definition
+		log.Printf("DEBUG [%s]: Calling generateMessageStructForSchema for %s (Payload: %s)", entityType, messageStructName, payloadStructName) // <-- Add Log
+		structDef, requiredImports, err := g.generateMessageStructForSchema(messageStructName, payloadStructName, messageSchemaMap)
+		if err != nil {
+			log.Printf("DEBUG [%s]: Error from generateMessageStructForSchema for %s: %v. Skipping.", entityType, messageStructName, err) // <-- Add Log
+			// log.Printf("Error generating message struct %s for %s: %v", messageStructName, eventDef.Name, err) // Original Error
+			continue
+		}
+		log.Printf("DEBUG [%s]: Successfully generated message struct definition for %s.", entityType, messageStructName) // <-- Add Log
+		structs = append(structs, structDef)
+		for imp := range requiredImports {
+			g.imports[imp] = true
+		}
+	}
+	log.Printf("DEBUG [%s]: Finished Step 2: Generate Message Structs", entityType) // <-- Add Log
 
 	// If no structs were successfully generated for this entity, don't create the file
 	if len(structs) == 0 {
@@ -833,4 +897,95 @@ package %s
 	}
 
 	return fileName, nil
+}
+
+// generateMessageStructForSchema generates a Go struct definition for a full message schema
+// Ensure it starts with func (g *Generator) ...
+func (g *Generator) generateMessageStructForSchema(
+	structName string, // e.g., DomainAnalysisRequestedMessage
+	payloadStructName string, // e.g., DomainAnalysisRequestedPayload
+	schemaMap map[string]interface{},
+) (string, map[string]bool, error) {
+
+	var buffer bytes.Buffer
+	requiredImports := make(map[string]bool)
+
+	// Add description from schema if available
+	if description, ok := schemaMap["description"].(string); ok && description != "" {
+		buffer.WriteString(fmt.Sprintf("// %s: %s\n", structName, description))
+	} else if title, ok := schemaMap["title"].(string); ok && title != "" {
+		buffer.WriteString(fmt.Sprintf("// %s: Based on schema '%s'\n", structName, title))
+	} else {
+		buffer.WriteString(fmt.Sprintf("// %s represents the structure for a specific event message.\n", structName))
+	}
+	buffer.WriteString(fmt.Sprintf("type %s struct {\n", structName))
+
+	// Get required fields from the message schema
+	requiredFields := make(map[string]bool)
+	if reqList, ok := schemaMap["required"].([]interface{}); ok {
+		for _, req := range reqList {
+			if reqStr, ok := req.(string); ok {
+				requiredFields[reqStr] = true
+			}
+		}
+	}
+
+	// Define standard BaseEventMessage fields and their JSON tags
+	// We assume the message schema follows the BaseEventMessage structure
+	fields := map[string]string{
+		"EventID":       "string",
+		"CorrelationID": "*string", // Pointer for omitempty
+		"Timestamp":     "time.Time",
+		"Entity":        "messages.Entity",
+		"Action":        "string",
+		"Actor":         "messages.Actor",
+		"Payload":       payloadStructName,        // Use the specific payload type name
+		"Metrics":       "*messages.EventMetrics", // Pointer for omitempty
+	}
+	jsonTags := map[string]string{
+		"EventID":       "event_id",
+		"CorrelationID": "correlation_id",
+		"Timestamp":     "timestamp",
+		"Entity":        "entity",
+		"Action":        "action",
+		"Actor":         "actor",
+		"Payload":       "payload",
+		"Metrics":       "metrics",
+	}
+
+	// Order fields for consistent output
+	fieldOrder := []string{"EventID", "CorrelationID", "Timestamp", "Entity", "Action", "Actor", "Payload", "Metrics"}
+
+	for _, fieldName := range fieldOrder {
+		fieldType := fields[fieldName]
+		jsonTag := jsonTags[fieldName]
+
+		// Add imports based on type
+		if fieldType == "time.Time" {
+			requiredImports["time"] = true
+		}
+		if strings.HasPrefix(fieldType, "messages.") || strings.HasPrefix(fieldType, "*messages.") {
+			// TODO: Make this import path configurable or determine it more reliably.
+			// Assuming the generated code is in a subpackage of the project using the library.
+			// If the generator is part of the library itself, this might need adjustment.
+			// For now, assume the library is imported as github.com/stufio-com/stufio-go-events
+			requiredImports["github.com/stufio-com/stufio-go-events/messages"] = true
+		}
+
+		// Determine omitempty
+		omitempty := ",omitempty"
+		if requiredFields[jsonTag] {
+			omitempty = "" // Remove omitempty if the field is required by the message schema
+		} else if fieldName != "CorrelationID" && fieldName != "Metrics" {
+			// By default, only make CorrelationID and Metrics omitempty unless required.
+			// All other base fields are assumed mandatory for a valid event message structure.
+			// If the schema explicitly requires CorrelationID or Metrics, omitempty will be removed above.
+		}
+
+		buffer.WriteString(fmt.Sprintf("\t%s %s `json:\"%s%s\"`\n", fieldName, fieldType, jsonTag, omitempty))
+	}
+
+	buffer.WriteString("}\n\n")
+
+	return buffer.String(), requiredImports, nil
 }

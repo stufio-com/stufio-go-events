@@ -51,12 +51,13 @@ func parseActualSchemaName(ref string) (string, error) {
 
 // ExtractEventDefinitions extracts event definitions from the schema
 // Updated to accept topicPrefix
-func (l *SchemaLoader) ExtractEventDefinitions(topicPrefix string) ([]messages.EventDefinition, error) {
+func (l *SchemaLoader) ExtractEventDefinitions(topicPrefix string) ([]messages.EventDefinition, map[string]string, error) {
 	if l.schema == nil {
-		return nil, fmt.Errorf("no schema loaded")
+		return nil, nil, fmt.Errorf("no schema loaded")
 	}
 
 	var definitions []messages.EventDefinition
+	messageSchemaRefs := make(map[string]string) // <-- Initialize the correct map
 
 	// Process each channel
 	for channelName, channel := range l.schema.Channels {
@@ -100,6 +101,57 @@ func (l *SchemaLoader) ExtractEventDefinitions(topicPrefix string) ([]messages.E
 				continue
 			}
 			definitions = append(definitions, event)
+
+			// --- Store the message schema ref ---
+			log.Printf("DEBUG [ExtractEventDefinitions]: Processing event '%s' for message schema ref extraction.", event.Name) // <-- Add Log
+			if resolvedMsg != nil && resolvedMsg.Payload != nil {
+				log.Printf("DEBUG [ExtractEventDefinitions]: Event '%s' has resolvedMsg and Payload map: %+v", event.Name, resolvedMsg.Payload) // <-- Add Log
+
+				// Find the $ref within the resolved message's payload field
+				// This ref points to the schema defining the BaseEventMessage structure
+				if refVal, ok := resolvedMsg.Payload["$ref"]; ok { // Check for $ref key in payload map
+					log.Printf("DEBUG [ExtractEventDefinitions]: Event '%s' payload has '$ref' key.", event.Name) // <-- Add Log
+					if refStr, ok := refVal.(string); ok {
+						log.Printf("DEBUG [ExtractEventDefinitions]: Found message schema ref '%s' for event '%s'", refStr, event.Name) // <-- Add Log
+						messageSchemaRefs[event.Name] = refStr                                                                          // event.Name is entity.action
+					} else {
+						log.Printf("DEBUG [ExtractEventDefinitions]: Payload $ref value is NOT a string for event '%s': Type=%T, Value=%+v", event.Name, refVal, refVal) // <-- Add Log
+					}
+				} else if oneOfVal, ok := resolvedMsg.Payload["oneOf"]; ok { // Check for oneOf key
+					log.Printf("DEBUG [ExtractEventDefinitions]: Event '%s' payload has 'oneOf' key.", event.Name) // <-- Add Log
+					// Handle oneOf case if necessary, find the $ref inside
+					if oneOfList, ok := oneOfVal.([]interface{}); ok && len(oneOfList) > 0 {
+						log.Printf("DEBUG [ExtractEventDefinitions]: Event '%s' payload 'oneOf' is a list with %d items.", event.Name, len(oneOfList)) // <-- Add Log
+						if firstChoice, ok := oneOfList[0].(map[string]interface{}); ok {
+							log.Printf("DEBUG [ExtractEventDefinitions]: Event '%s' payload 'oneOf'[0] is a map: %+v", event.Name, firstChoice) // <-- Add Log
+							if refVal, ok := firstChoice["$ref"]; ok {
+								log.Printf("DEBUG [ExtractEventDefinitions]: Event '%s' payload 'oneOf'[0] has '$ref' key.", event.Name) // <-- Add Log
+								if refStr, ok := refVal.(string); ok {
+									log.Printf("DEBUG [ExtractEventDefinitions]: Found message schema ref '%s' (from oneOf) for event '%s'", refStr, event.Name) // <-- Add Log
+									messageSchemaRefs[event.Name] = refStr
+								} else {
+									log.Printf("DEBUG [ExtractEventDefinitions]: Payload oneOf $ref value is NOT a string for event '%s': Type=%T, Value=%+v", event.Name, refVal, refVal) // <-- Add Log
+								}
+							} else {
+								log.Printf("DEBUG [ExtractEventDefinitions]: Payload oneOf item has NO $ref for event '%s': %+v", event.Name, firstChoice) // <-- Add Log
+							}
+						} else {
+							log.Printf("DEBUG [ExtractEventDefinitions]: Payload oneOf item is NOT a map for event '%s': Type=%T, Value=%+v", event.Name, oneOfList[0], oneOfList[0]) // <-- Add Log
+						}
+					} else {
+						log.Printf("DEBUG [ExtractEventDefinitions]: Payload oneOf value is NOT a list or is empty for event '%s': Type=%T, Value=%+v", event.Name, oneOfVal, oneOfVal) // <-- Add Log
+					}
+				} else {
+					log.Printf("DEBUG [ExtractEventDefinitions]: Payload for event '%s' has NEITHER $ref NOR oneOf key: %+v", event.Name, resolvedMsg.Payload) // <-- Add Log
+				}
+			} else {
+				errMsg := "resolvedMsg is nil"
+				if resolvedMsg != nil { // Implies Payload is nil
+					errMsg = "resolvedMsg.Payload is nil"
+				}
+				log.Printf("DEBUG [ExtractEventDefinitions]: Skipping message schema ref extraction for event '%s' (%s)", event.Name, errMsg) // <-- Add Log
+			}
+			// --- End store message schema ref ---
 		}
 
 		// Process subscribe operation (events we can produce)
@@ -134,10 +186,61 @@ func (l *SchemaLoader) ExtractEventDefinitions(topicPrefix string) ([]messages.E
 				continue
 			}
 			definitions = append(definitions, event)
+
+			// --- Store the message schema ref ---
+			log.Printf("DEBUG [ExtractEventDefinitions]: Processing event '%s' for message schema ref extraction.", event.Name) // <-- Add Log
+			if resolvedMsg != nil && resolvedMsg.Payload != nil {
+				log.Printf("DEBUG [ExtractEventDefinitions]: Event '%s' has resolvedMsg and Payload map: %+v", event.Name, resolvedMsg.Payload) // <-- Add Log
+
+				// Find the $ref within the resolved message's payload field
+				// This ref points to the schema defining the BaseEventMessage structure
+				if refVal, ok := resolvedMsg.Payload["$ref"]; ok { // Check for $ref key in payload map
+					log.Printf("DEBUG [ExtractEventDefinitions]: Event '%s' payload has '$ref' key.", event.Name) // <-- Add Log
+					if refStr, ok := refVal.(string); ok {
+						log.Printf("DEBUG [ExtractEventDefinitions]: Found message schema ref '%s' for event '%s'", refStr, event.Name) // <-- Add Log
+						messageSchemaRefs[event.Name] = refStr                                                                          // Store the message schema ref
+					} else {
+						log.Printf("DEBUG [ExtractEventDefinitions]: Payload $ref value is NOT a string for event '%s': Type=%T, Value=%+v", event.Name, refVal, refVal) // <-- Add Log
+					}
+				} else if oneOfVal, ok := resolvedMsg.Payload["oneOf"]; ok { // Check for oneOf key
+					log.Printf("DEBUG [ExtractEventDefinitions]: Event '%s' payload has 'oneOf' key.", event.Name) // <-- Add Log
+					// Handle oneOf case if necessary, find the $ref inside
+					if oneOfList, ok := oneOfVal.([]interface{}); ok && len(oneOfList) > 0 {
+						log.Printf("DEBUG [ExtractEventDefinitions]: Event '%s' payload 'oneOf' is a list with %d items.", event.Name, len(oneOfList)) // <-- Add Log
+						if firstChoice, ok := oneOfList[0].(map[string]interface{}); ok {
+							log.Printf("DEBUG [ExtractEventDefinitions]: Event '%s' payload 'oneOf'[0] is a map: %+v", event.Name, firstChoice) // <-- Add Log
+							if refVal, ok := firstChoice["$ref"]; ok {
+								log.Printf("DEBUG [ExtractEventDefinitions]: Event '%s' payload 'oneOf'[0] has '$ref' key.", event.Name) // <-- Add Log
+								if refStr, ok := refVal.(string); ok {
+									log.Printf("DEBUG [ExtractEventDefinitions]: Found message schema ref '%s' (from oneOf) for event '%s'", refStr, event.Name) // <-- Add Log
+									messageSchemaRefs[event.Name] = refStr                                                                                       // Store the message schema ref
+								} else {
+									log.Printf("DEBUG [ExtractEventDefinitions]: Payload oneOf $ref value is NOT a string for event '%s': Type=%T, Value=%+v", event.Name, refVal, refVal) // <-- Add Log
+								}
+							} else {
+								log.Printf("DEBUG [ExtractEventDefinitions]: Payload oneOf item has NO $ref for event '%s': %+v", event.Name, firstChoice) // <-- Add Log
+							}
+						} else {
+							log.Printf("DEBUG [ExtractEventDefinitions]: Payload oneOf item is NOT a map for event '%s': Type=%T, Value=%+v", event.Name, oneOfList[0], oneOfList[0]) // <-- Add Log
+						}
+					} else {
+						log.Printf("DEBUG [ExtractEventDefinitions]: Payload oneOf value is NOT a list or is empty for event '%s': Type=%T, Value=%+v", event.Name, oneOfVal, oneOfVal) // <-- Add Log
+					}
+				} else {
+					log.Printf("DEBUG [ExtractEventDefinitions]: Payload for event '%s' has NEITHER $ref NOR oneOf key: %+v", event.Name, resolvedMsg.Payload) // <-- Add Log
+				}
+			} else {
+				errMsg := "resolvedMsg is nil"
+				if resolvedMsg != nil { // Implies Payload is nil
+					errMsg = "resolvedMsg.Payload is nil"
+				}
+				log.Printf("DEBUG [ExtractEventDefinitions]: Skipping message schema ref extraction for event '%s' (%s)", event.Name, errMsg) // <-- Add Log
+			}
+			// --- End store message schema ref ---
 		}
 	}
 
-	return definitions, nil
+	return definitions, messageSchemaRefs, nil
 }
 
 // ExtractPayloadSchemasAndRefs extracts payload schemas and their reference paths
@@ -511,9 +614,15 @@ func (r *SchemaRegistry) RefreshSchemas() error {
 	topicPrefix := config.DefaultEventsConfig().KafkaTopicPrefix
 
 	// Extract event definitions - pass the topic prefix
-	definitions, errDefs := r.loader.ExtractEventDefinitions(topicPrefix) // Pass prefix
+	// Capture all three return values: definitions, messageSchemaRefs, and error
+	definitions, messageSchemaRefs, errDefs := r.loader.ExtractEventDefinitions(topicPrefix) // Pass prefix
 	if errDefs != nil {
 		log.Printf("Warning: Error extracting event definitions: %v", errDefs)
+		// Consider if this error should be fatal or if partial data is acceptable
+	}
+	// Add a log for the captured message schema refs (optional debug)
+	if len(messageSchemaRefs) > 0 {
+		log.Printf("DEBUG: Extracted %d message schema references.", len(messageSchemaRefs))
 	}
 
 	// Extract payload schemas (raw maps) AND their original $refs
