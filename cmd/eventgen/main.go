@@ -11,6 +11,13 @@ import (
 	"github.com/stufio-com/stufio-go-events/schema"
 )
 
+const (
+	// DefaultKafkaTopicPrefix is the default prefix if none is provided
+	DefaultKafkaTopicPrefix = "nameniac.events"
+	// KafkaTopicPrefixEnvVar is the environment variable to check for the prefix
+	KafkaTopicPrefixEnvVar = "EVENTS_KAFKA_TOPIC_PREFIX"
+)
+
 func main() {
 	// Parse command line arguments
 	asyncAPIFile := flag.String("schema", "", "Path to AsyncAPI schema file (JSON or YAML)")
@@ -20,6 +27,7 @@ func main() {
 	entityTypes := flag.String("entities", "", "Comma-separated list of entity types to include (empty = all)")
 	includeTypes := flag.String("include", "", "Comma-separated list of entity.action patterns to include (supports wildcards)")
 	excludeTypes := flag.String("exclude", "", "Comma-separated list of entity.action patterns to exclude (supports wildcards)")
+	topicPrefixFlag := flag.String("topicPrefix", "", fmt.Sprintf("Default Kafka topic prefix (overrides %s env var)", KafkaTopicPrefixEnvVar)) // <-- Add flag
 	verbose := flag.Bool("v", false, "Verbose output")
 	help := flag.Bool("help", false, "Show help")
 
@@ -36,6 +44,20 @@ func main() {
 		printUsage()
 		os.Exit(1)
 	}
+
+	// --- Determine Topic Prefix ---
+	topicPrefix := DefaultKafkaTopicPrefix // Start with default
+	envPrefix := os.Getenv(KafkaTopicPrefixEnvVar)
+	if envPrefix != "" {
+		topicPrefix = envPrefix // Use environment variable if set
+	}
+	if *topicPrefixFlag != "" {
+		topicPrefix = *topicPrefixFlag // Use flag if provided (highest priority)
+	}
+	if *verbose {
+		fmt.Printf("Using Kafka topic prefix: %s\n", topicPrefix)
+	}
+	// --- End Determine Topic Prefix ---
 
 	// Create output directory if it doesn't exist
 	if err := os.MkdirAll(*outputDir, 0755); err != nil {
@@ -102,18 +124,19 @@ func main() {
 	}
 
 	// Extract payload schemas (now returns map[string]map[string]interface{})
-	payloadSchemas, err := loader.ExtractPayloadSchemas()
+	// We primarily need the payloadRefs map from this.
+	_, payloadRefs, err := loader.ExtractPayloadSchemasAndRefs() // Keep payloadRefs
 	if err != nil {
 		// Log non-fatal errors from ExtractPayloadSchemas already, just check final error state if needed
 		log.Printf("Warning: Encountered errors during payload schema extraction: %v", err)
 		// Decide if this should be fatal or not. Let's allow continuing.
 	}
-	if len(payloadSchemas) == 0 {
-		log.Fatalf("No payload schemas were successfully extracted. Check warnings.")
-	}
+	// We don't strictly need to fail if payloadRefs is empty,
+	// as some events might genuinely have no payload.
+	// The generator should handle missing refs gracefully.
 
-	// Extract event definitions
-	eventDefs, err := loader.ExtractEventDefinitions()
+	// Extract event definitions - Pass the determined topic prefix
+	eventDefs, err := loader.ExtractEventDefinitions(topicPrefix) // <-- Pass determined prefix
 	if err != nil {
 		log.Fatalf("Failed to extract event definitions: %v", err)
 	}
@@ -123,10 +146,12 @@ func main() {
 
 	// Generate structs
 	if *verbose {
-		fmt.Printf("Generating Go structs for %d schemas in %s\n", len(payloadSchemas), *outputDir)
+		// Correct the log message if needed, based on what GenerateStructs uses
+		fmt.Printf("Generating Go structs based on %d event definitions in %s\n", len(eventDefs), *outputDir)
 	}
 
-	files, err := generator.GenerateStructs(payloadSchemas, eventDefs, *outputDir)
+	// Pass the full component schemas and the map of payload references
+	files, err := generator.GenerateStructs(schemaComponents.Schemas, payloadRefs, eventDefs, *outputDir)
 	if err != nil {
 		log.Fatalf("Failed to generate structs: %v", err) // This captures errors from file writing etc.
 	}
@@ -151,6 +176,10 @@ func printUsage() {
 	fmt.Println("\nExamples:")
 	fmt.Println("  # Generate all events:")
 	fmt.Println("  eventgen -schema ./asyncapi.json -output ./generated -package myevents")
+	fmt.Println("\n  # Generate with a specific topic prefix:")
+	fmt.Println("  eventgen -schema ./asyncapi.json -output ./generated -topicPrefix myapp.events")
+	fmt.Println("\n  # Generate using environment variable for prefix:")
+	fmt.Println("  export EVENTS_KAFKA_TOPIC_PREFIX=myapp.events && eventgen -schema ./asyncapi.json -output ./generated")
 	fmt.Println("\n  # Generate only domain-related events:")
 	fmt.Println("  eventgen -schema ./asyncapi.json -output ./generated -entities domain")
 	fmt.Println("\n  # Generate only specific event patterns:")

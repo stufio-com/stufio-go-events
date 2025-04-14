@@ -62,15 +62,11 @@ type TypedEventMessage[T any] struct {
 
 // EventDefinition defines a specific type of event
 type EventDefinition struct {
-	Name           string `json:"name"`
-	EntityType     string `json:"entity_type"`
-	Action         string `json:"action"`
-	Description    string `json:"description"`
-	Topic          string `json:"topic"`
-	HighVolume     bool   `json:"high_volume"`
-	RequireActor   bool   `json:"require_actor"`
-	RequireEntity  bool   `json:"require_entity"`
-	RequirePayload bool   `json:"require_payload"`
+	Name        string `json:"name"`
+	EntityType  string `json:"entity_type"`
+	Action      string `json:"action"`
+	Description string `json:"description"`
+	Topic       string `json:"topic"`
 }
 
 // FromJSON deserializes a JSON message into an event message

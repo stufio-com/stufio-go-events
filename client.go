@@ -22,30 +22,32 @@ type EventClient struct {
 }
 
 // NewEventClient creates a new event client
-func NewEventClient(kafkaConfig *config.KafkaConfig) (*EventClient, error) {
+func NewEventClient(kafkaConfig config.KafkaConfig) (*EventClient, error) { // Accept value type for KafkaConfig
 	// Create default events config
 	eventsConfig := config.DefaultEventsConfig()
-	eventsConfig.Kafka = kafkaConfig
+	eventsConfig.Kafka = kafkaConfig // Assign the provided Kafka config
 
-	return NewEventClientWithConfig(eventsConfig)
+	// Pass the address of eventsConfig
+	return NewEventClientWithConfig(&eventsConfig) // <-- Pass pointer using &
 }
 
 // NewEventClientWithConfig creates an event client with a specified config
-func NewEventClientWithConfig(config *config.EventsConfig) (*EventClient, error) {
+func NewEventClientWithConfig(config *config.EventsConfig) (*EventClient, error) { // Expects pointer
 	// Initialize schema registry
-	schema.InitGlobalRegistry(config.AsyncAPIURL, config.SchemaRefreshTime, config.SchemaValidation)
+	// Use config fields directly
+	schema.InitGlobalRegistry(config.AsyncAPIURL, config.RefreshInterval, config.SchemaValidation)
 	schemaRegistry := schema.GetGlobalRegistry()
 
-	// Create producer
-	prod, err := producer.NewEventProducer(config.Kafka)
+	// Create producer - Pass the KafkaConfig value from the main config
+	prod, err := producer.NewEventProducer(&config.Kafka)
 	if err != nil {
 		return nil, fmt.Errorf("creating event producer: %w", err)
 	}
 
-	// Create consumer if topics are specified
+	// Create consumer if topics are specified - Pass the KafkaConfig value
 	var cons *consumer.EventConsumer
 	if len(config.Kafka.Topics) > 0 {
-		cons, err = consumer.NewEventConsumer(config.Kafka)
+		cons, err = consumer.NewEventConsumer(&config.Kafka)
 		if err != nil {
 			prod.Close() // Clean up producer if consumer creation fails
 			return nil, fmt.Errorf("creating event consumer: %w", err)
@@ -55,7 +57,7 @@ func NewEventClientWithConfig(config *config.EventsConfig) (*EventClient, error)
 	return &EventClient{
 		producer:       prod,
 		consumer:       cons,
-		config:         config,
+		config:         config, // Store the pointer
 		schemaRegistry: schemaRegistry,
 	}, nil
 }
@@ -92,9 +94,14 @@ func (c *EventClient) PublishEvent(
 	payload interface{},
 	correlationID string,
 ) error {
-	// Validate payload against schema
-	if err := c.schemaRegistry.ValidatePayload(entity.Type, action, payload); err != nil {
-		return fmt.Errorf("payload validation failed: %w", err)
+	// Skip validation when disabled
+	if c.config.SchemaValidation {
+		if err := c.schemaRegistry.ValidatePayload(entity.Type, action, payload); err != nil {
+			// Consider logging the validation error but not returning it,
+			// depending on whether validation failure should block publishing.
+			// For now, return the error.
+			return fmt.Errorf("payload validation failed: %w", err)
+		}
 	}
 
 	// Create base event message
@@ -107,29 +114,40 @@ func (c *EventClient) PublishEvent(
 	eventMsg := &messages.BaseEventMessage{
 		EventID:       eventID,
 		CorrelationID: correlID,
-		Timestamp:     time.Now(),
+		Timestamp:     time.Now().UTC(), // Use UTC time
 		Entity: messages.Entity{
 			Type: entity.Type,
 			ID:   entity.ID,
 		},
 		Action: action,
 		Actor: messages.Actor{
-			Type: messages.ActorType(actor.Type),
+			Type: messages.ActorType(actor.Type), // Ensure conversion to ActorType
 			ID:   actor.ID,
 		},
 		Payload: payload,
 	}
 
-	// Get topic from registry if not specified directly
+	// --- Determine Topic ---
 	topic := topicName
 	if topic == "" {
-		if eventDef, found := c.schemaRegistry.GetEventDefinition(entity.Type, action); found {
+		// Try getting topic from schema registry first
+		if eventDef, found := c.schemaRegistry.GetEventDefinition(entity.Type, action); found && eventDef.Topic != "" {
 			topic = eventDef.Topic
+		} else {
+			// Fallback to default topic prefix from config if schema registry has no info
+			// or if validation is disabled (schema registry might be empty)
+			topic = c.config.KafkaTopicPrefix // <-- Use prefix from config
+			if topic == "" {
+				// Final fallback if prefix is also empty in config (should not happen with defaults)
+				return fmt.Errorf("no topic specified and no default topic prefix configured for %s.%s", entity.Type, action)
+			}
 		}
 	}
+	// --- End Determine Topic ---
 
 	if topic == "" {
-		return fmt.Errorf("no topic found for %s.%s", entity.Type, action)
+		// This check is likely redundant now due to the logic above, but keep for safety
+		return fmt.Errorf("could not determine topic for %s.%s", entity.Type, action)
 	}
 
 	// Publish message

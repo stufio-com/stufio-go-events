@@ -134,83 +134,69 @@ func (g *Generator) shouldIncludeEvent(entityType, action string) bool {
 }
 
 // GenerateStructs generates Go structs from the provided schemas
-// Accepts map[string]map[string]interface{} for schemas
-func (g *Generator) GenerateStructs(schemas map[string]map[string]interface{}, events []messages.EventDefinition, outputDir string) ([]string, error) {
+// Updated signature to accept allSchemas and payloadRefs
+func (g *Generator) GenerateStructs(allSchemas map[string]interface{}, payloadRefs map[string]string, eventDefs []messages.EventDefinition, outputDir string) ([]string, error) {
 	var files []string
+	g.generatedTypes = make(map[string]bool)                    // Reset generated types tracker
+	g.enumsToGenerate = make(map[string]map[string]interface{}) // Reset enums tracker
 
 	// Filter events based on configured filters
-	var filteredEvents []messages.EventDefinition
-	for _, event := range events {
-		if g.shouldIncludeEvent(event.EntityType, event.Action) {
-			filteredEvents = append(filteredEvents, event)
+	var filteredEventDefs []messages.EventDefinition
+	for _, eventDef := range eventDefs {
+		if g.shouldIncludeEvent(eventDef.EntityType, eventDef.Action) {
+			filteredEventDefs = append(filteredEventDefs, eventDef)
 		} else if g.verbose {
-			fmt.Printf("Skipping event: %s.%s (filtered out)\n", event.EntityType, event.Action)
+			fmt.Printf("Skipping event: %s (filtered out)\n", eventDef.Name)
 		}
 	}
 
-	// Filter schemas based on filtered events
-	filteredSchemas := make(map[string]map[string]interface{}) // Use correct type
-	for name, schema := range schemas {
-		parts := strings.Split(name, ".")
-		if len(parts) >= 2 {
-			entityType := parts[0]
-			action := parts[1]
-
-			if g.shouldIncludeEvent(entityType, action) {
-				filteredSchemas[name] = schema // Store the map
-			}
-		}
+	if len(filteredEventDefs) == 0 {
+		log.Println("No events left after filtering.")
+		return files, nil // No files to generate
 	}
-
-	// --- Pre-process schemas to find all enums ---
-	// Iterate through all filtered schemas and their properties to populate g.enumsToGenerate
-	// This ensures enums are detected even if not directly used by a filtered event's top-level payload
-	// (though the current logic in jsonSchemaToGoType called during entity file generation should cover most cases)
-	// For simplicity, we rely on jsonSchemaToGoType called during entity generation to populate the map.
 
 	// Generate event types file only for filtered events
-	eventTypesFile, err := g.generateEventTypes(filteredEvents, outputDir)
+	eventTypesFile, err := g.generateEventTypes(filteredEventDefs, outputDir)
 	if err != nil {
 		return nil, fmt.Errorf("generating event types: %w", err)
 	}
-	if eventTypesFile != "" { // Check if file was actually generated
+	if eventTypesFile != "" {
 		files = append(files, eventTypesFile)
 	}
 
-	// Process each schema in filtered schemas to generate entity files
-	// This process will populate g.enumsToGenerate via calls to jsonSchemaToGoType
-	processedEntities := make(map[string]bool) // Track processed entities to generate file once
-	for name := range filteredSchemas {
-		// Parse entity and action from the name
-		parts := strings.Split(name, ".")
-		if len(parts) < 2 {
-			if g.verbose {
-				fmt.Printf("Skipping schema with invalid name: %s\n", name)
-			}
-			continue
-		}
-		entity := parts[0]
-
-		// Generate file for this entity if it hasn't been processed yet
-		if !processedEntities[entity] {
-			fileName, err := g.generateEntityFile(entity, filteredSchemas, filteredEvents, outputDir)
-			if err != nil {
-				log.Printf("Error generating entity file for %s: %v", entity, err)
-			} else if fileName != "" {
-				files = append(files, fileName)
-			}
-			processedEntities[entity] = true
-		}
-		// Note: g.enumsToGenerate is populated during generateEntityFile -> generateStructForSchema -> jsonSchemaToGoType
+	// --- Generate entity-specific files ---
+	// Group filtered events by entity type to process each entity once
+	eventsByEntity := make(map[string][]messages.EventDefinition)
+	for _, eventDef := range filteredEventDefs {
+		eventsByEntity[eventDef.EntityType] = append(eventsByEntity[eventDef.EntityType], eventDef)
 	}
 
-	// --- Generate common types file AFTER processing entities ---
+	// Process each entity
+	for entityType, entityEventDefs := range eventsByEntity {
+		// Sort events within the entity for consistent file generation
+		sort.Slice(entityEventDefs, func(i, j int) bool {
+			return entityEventDefs[i].Action < entityEventDefs[j].Action
+		})
+
+		// Generate the file for this entity, passing the relevant event definitions
+		// and the necessary maps for schema lookup
+		fileName, err := g.generateEntityFile(entityType, entityEventDefs, allSchemas, payloadRefs, outputDir)
+		if err != nil {
+			// Log error but continue with other entities
+			log.Printf("Error generating entity file for %s: %v", entityType, err)
+		} else if fileName != "" {
+			files = append(files, fileName)
+		}
+	}
+	// Note: g.enumsToGenerate is populated during generateEntityFile -> generateStructForSchema -> jsonSchemaToGoType
+
+	// --- Generate common types file AFTER processing all entities ---
 	commonTypesFile, err := g.generateCommonTypesFile(outputDir)
 	if err != nil {
 		// Log error but potentially continue? Or make it fatal? Let's make it fatal for now.
 		return files, fmt.Errorf("generating common types file: %w", err)
 	}
-	if commonTypesFile != "" { // Check if file was actually generated
+	if commonTypesFile != "" {
 		files = append(files, commonTypesFile)
 	}
 
@@ -281,59 +267,56 @@ func (g *Generator) generateEventTypes(events []messages.EventDefinition, output
 }
 
 // generateEntityFile generates a file for an entity with all its event payloads
-func (g *Generator) generateEntityFile(entityType string, allSchemas map[string]map[string]interface{}, events []messages.EventDefinition, outputDir string) (string, error) {
+// Updated signature to accept necessary maps
+func (g *Generator) generateEntityFile(entityType string, entityEventDefs []messages.EventDefinition, allSchemas map[string]interface{}, payloadRefs map[string]string, outputDir string) (string, error) {
 	// Reset imports for this file
 	g.imports = make(map[string]bool)
 
-	// Find all schemas for this entity
-	type entitySchemaInfo struct {
-		Name      string
-		Action    string
-		SchemaMap map[string]interface{}
-	}
-	var entitySchemas []entitySchemaInfo
-
-	for name, schemaMap := range allSchemas {
-		parts := strings.Split(name, ".")
-		if len(parts) >= 2 && parts[0] == entityType {
-			entitySchemas = append(entitySchemas, entitySchemaInfo{
-				Name:      name,
-				Action:    parts[1],
-				SchemaMap: schemaMap,
-			})
-		}
-	}
-
-	if len(entitySchemas) == 0 {
-		if g.verbose {
-			fmt.Printf("No schemas found for entity: %s\n", entityType)
-		}
-		return "", nil // Return empty string, not an error
-	}
-
-	// Sort schemas by action name for consistency
-	sort.Slice(entitySchemas, func(i, j int) bool {
-		return entitySchemas[i].Action < entitySchemas[j].Action
-	})
-
-	// Get event definitions for this entity
-	var entityEvents []messages.EventDefinition
-	for _, event := range events {
-		if event.EntityType == entityType {
-			entityEvents = append(entityEvents, event)
-		}
-	}
-
-	// Generate struct definitions
 	structs := []string{}
 	imports := []string{}
 
-	for _, schemaInfo := range entitySchemas {
-		// Pass the schema map directly
-		structDef, requiredImports, err := g.generateStructForSchema(entityType, schemaInfo.Action, schemaInfo.SchemaMap)
+	// Iterate through the event definitions for this entity
+	for _, eventDef := range entityEventDefs {
+		payloadRef, refExists := payloadRefs[eventDef.Name]
+		if !refExists {
+			if g.verbose {
+				log.Printf("No payload reference found for event %s, generating empty struct.", eventDef.Name)
+			}
+			// Generate an empty struct if no ref exists
+			structName := pascalCase(eventDef.Action) + "Payload"
+			structs = append(structs, fmt.Sprintf("// %s represents the payload for %s events (no schema defined)\ntype %s struct {}", structName, eventDef.Name, structName))
+			continue // Move to the next event
+		}
+
+		// Parse the actual schema name from the reference
+		actualSchemaName, err := parseActualSchemaName(payloadRef)
+		if err != nil {
+			log.Printf("Error parsing schema name from ref '%s' for event %s: %v. Skipping struct generation.", payloadRef, eventDef.Name, err)
+			continue // Skip this event's struct
+		}
+
+		// Look up the schema definition in the main components map
+		payloadSchemaData, schemaExists := allSchemas[actualSchemaName]
+		if !schemaExists {
+			log.Printf("Warning: Schema definition '%s' (from ref '%s' for event '%s') not found in components. Generating empty struct.", actualSchemaName, payloadRef, eventDef.Name)
+			// Generate an empty struct if schema definition is missing
+			structName := pascalCase(eventDef.Action) + "Payload"
+			structs = append(structs, fmt.Sprintf("// %s represents the payload for %s events (schema '%s' not found)\ntype %s struct {}", structName, eventDef.Name, actualSchemaName, structName))
+			continue // Move to the next event
+		}
+
+		// Assert that the looked-up schema is a map
+		schemaMap, ok := payloadSchemaData.(map[string]interface{})
+		if !ok {
+			log.Printf("Warning: Schema definition '%s' for event %s is not a valid map structure. Skipping struct generation.", actualSchemaName, eventDef.Name)
+			continue // Skip this event's struct
+		}
+
+		// Generate the struct definition using the found schema map
+		structDef, requiredImports, err := g.generateStructForSchema(eventDef.EntityType, eventDef.Action, schemaMap)
 		if err != nil {
 			// Log error but continue generating other structs for this entity
-			log.Printf("Error generating struct for %s.%s: %v", entityType, schemaInfo.Action, err)
+			log.Printf("Error generating struct for %s: %v", eventDef.Name, err)
 			continue // Skip this struct
 		}
 
@@ -345,9 +328,11 @@ func (g *Generator) generateEntityFile(entityType string, allSchemas map[string]
 		}
 	}
 
-	// If no structs were successfully generated, don't create the file
+	// If no structs were successfully generated for this entity, don't create the file
 	if len(structs) == 0 {
-		log.Printf("No structs generated for entity file: %s", entityType)
+		if g.verbose {
+			log.Printf("No structs generated for entity file: %s", entityType)
+		}
 		return "", nil
 	}
 
@@ -362,10 +347,10 @@ func (g *Generator) generateEntityFile(entityType string, allSchemas map[string]
 		"Package":    g.packageName,
 		"Timestamp":  time.Now().Format(time.RFC3339),
 		"EntityType": entityType,
-		"StructName": pascalCase(entityType), // This might not be used if structs are named per action
-		"Structs":    structs,
-		"Imports":    imports,
-		"Events":     entityEvents, // Keep events for potential future use in template
+		// "StructName": pascalCase(entityType), // Not needed here
+		"Structs": structs,
+		"Imports": imports,
+		// "Events":     entityEventDefs, // Keep events for potential future use in template
 	}
 
 	// Create the template
@@ -543,14 +528,15 @@ func (g *Generator) jsonSchemaToGoType(schema map[string]interface{}) (string, m
 	}
 
 	// Handle combined types like anyOf, oneOf (use interface{} for simplicity for now)
-	if _, ok := schema["anyOf"]; ok {
-		log.Printf("Warning: anyOf type found, using interface{}")
-		return "interface{}", imports
+	if _, exists := schema["anyOf"]; exists {
+		log.Println("Warning: anyOf type found, using interface{}") // Warning source
+		return "interface{}", nil                                   // Defaults to interface{}
 	}
-	if _, ok := schema["oneOf"]; ok {
-		log.Printf("Warning: oneOf type found, using interface{}")
-		return "interface{}", imports
+	if _, exists := schema["oneOf"]; exists {
+		log.Println("Warning: oneOf type found, using interface{}") // Similar handling
+		return "interface{}", nil
 	}
+
 	if _, ok := schema["allOf"]; ok {
 		// If allOf has a single $ref, handle it like a direct $ref
 		allOfItems, ok := schema["allOf"].([]interface{})

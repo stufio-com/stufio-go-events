@@ -3,9 +3,7 @@ package schema
 import (
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
-	"net/http" // Import strings
+	"log" // Import strings
 	"sync"
 	"time"
 
@@ -34,18 +32,22 @@ func NewSchemaRegistry(asyncAPIURL string, refreshTime time.Duration, validation
 		loader:            NewSchemaLoader(),
 		asyncAPIURL:       asyncAPIURL,
 		eventSchemas:      make(map[string]*gojsonschema.Schema),
-		payloadSchemaRefs: make(map[string]string), // Initialize ref map
+		payloadSchemaRefs: make(map[string]string),
 		refreshTime:       refreshTime,
 		validationEnabled: validationEnabled,
 	}
 
-	// Initial schema load
-	if err := registry.RefreshSchemas(); err != nil {
-		log.Printf("Warning: Failed to load initial schemas: %v", err)
+	// Only attempt schema load if validation is enabled
+	if validationEnabled {
+		if err := registry.RefreshSchemas(); err != nil {
+			log.Printf("Warning: Failed to load initial schemas: %v", err)
+		}
+	} else {
+		log.Printf("Schema validation disabled, skipping initial schema load.")
 	}
 
-	// Start periodic refresh if configured
-	if refreshTime > 0 {
+	// Start periodic refresh if configured and validation is enabled
+	if refreshTime > 0 && validationEnabled {
 		go registry.periodicRefresh()
 	}
 
@@ -65,103 +67,9 @@ func (r *SchemaRegistry) periodicRefresh() {
 	}
 }
 
-// RefreshSchemas loads and parses schemas from the AsyncAPI URL
-func (r *SchemaRegistry) RefreshSchemas() error {
-	log.Printf("Refreshing AsyncAPI schemas from %s", r.asyncAPIURL)
-
-	// Load the raw schema data first
-	rawSchemaData, err := r.loader.fetchSchemaData(r.asyncAPIURL)
-	if err != nil {
-		log.Printf("Warning: Failed fetching schema data from %s: %v", r.asyncAPIURL, err)
-		return fmt.Errorf("fetching schema data: %w", err)
-	}
-
-	// Parse the raw data into the full schema map
-	var fullSchemaMap map[string]interface{}
-	if err := json.Unmarshal(rawSchemaData, &fullSchemaMap); err != nil {
-		// Make this error fatal for the refresh operation
-		log.Printf("ERROR: Failed unmarshalling full schema map from %s: %v", r.asyncAPIURL, err)
-		return fmt.Errorf("unmarshalling full schema map: %w", err) // Return error
-	}
-
-	// --- Log top-level keys for debugging ---
-	var keys []string
-	for k := range fullSchemaMap {
-		keys = append(keys, k)
-	}
-	log.Printf("DEBUG: Top-level keys in fetched schema: %v", keys)
-	// --- End Debug ---
-
-	// Now load it into the structured loader
-	if err := r.loader.LoadFromJSON(rawSchemaData); err != nil {
-		// Make this error fatal too
-		log.Printf("ERROR: Failed loading AsyncAPI schema structure from %s: %v", r.asyncAPIURL, err)
-		return fmt.Errorf("loading AsyncAPI schema structure: %w", err) // Return error
-	}
-
-	// Extract event definitions
-	definitions, errDefs := r.loader.ExtractEventDefinitions()
-	if errDefs != nil {
-		log.Printf("Warning: Error extracting event definitions: %v", errDefs)
-	}
-
-	// Extract payload schemas (raw maps) AND their original $refs
-	// Modify ExtractPayloadSchemas to return refs as well
-	_, payloadRefs, errPayloads := r.loader.ExtractPayloadSchemasAndRefs() // <-- Need to implement this
-	if errPayloads != nil {
-		log.Printf("Warning: Error extracting payload schemas: %v", errPayloads)
-	}
-
-	// Update registry
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if errDefs == nil {
-		r.definitions = definitions
-	}
-	r.rawFullSchema = fullSchemaMap
-	r.payloadSchemaRefs = payloadRefs // Store the refs
-
-	compiledSchemas := make(map[string]*gojsonschema.Schema)
-	schemaLoaderWithContext := gojsonschema.NewSchemaLoader()
-	// Add the full schema document with a base URI to allow resolving #/components/...
-	errAdd := schemaLoaderWithContext.AddSchema("asyncapi", gojsonschema.NewGoLoader(r.rawFullSchema))
-	if errAdd != nil {
-		log.Printf("Error adding full schema to validator context: %v", errAdd)
-		// Cannot proceed with compilation if context fails
-		r.eventSchemas = make(map[string]*gojsonschema.Schema) // Clear potentially stale schemas
-		return fmt.Errorf("adding full schema context: %w", errAdd)
-	}
-	r.fullSchemaValidator = schemaLoaderWithContext // Store the loader
-
-	// Compile each specific payload schema using the context loader
-	for key, payloadRef := range r.payloadSchemaRefs {
-		// --- Add Debug Log ---
-		log.Printf("DEBUG: Attempting to compile schema for key '%s' using ref: '%s'", key, payloadRef)
-		// --- End Debug Log ---
-
-		// Use the loader (which contains the full schema) to compile the specific ref
-		// The reference itself should be just "#/components/schemas/..."
-		refLoader := gojsonschema.NewReferenceLoader(payloadRef)          // Use the original ref
-		compiledSchema, err := schemaLoaderWithContext.Compile(refLoader) // Compile using the loader that has the full schema context
-		if err != nil {
-			// Log the specific ref that failed
-			log.Printf("Error compiling schema for %s (ref: %s): %v. Check schema structure and $refs.", key, payloadRef, err)
-			continue // Skip this schema, but try others
-		}
-		compiledSchemas[key] = compiledSchema
-	}
-
-	r.eventSchemas = compiledSchemas // Update compiled schemas map
-	r.lastRefresh = time.Now()
-	log.Printf("AsyncAPI schema refreshed: %d event definitions, %d payload schemas compiled (check warnings for errors)",
-		len(r.definitions), len(compiledSchemas))
-
-	return nil // Return nil even if only parts failed, rely on logs
-}
-
 // ValidatePayload validates a payload against its schema
 func (r *SchemaRegistry) ValidatePayload(entityType, action string, payload interface{}) error {
+	// Early return if validation is disabled
 	if !r.validationEnabled {
 		return nil
 	}
@@ -246,25 +154,4 @@ func GetGlobalRegistry() *SchemaRegistry {
 		panic("Schema registry not initialized. Call InitGlobalRegistry first")
 	}
 	return globalRegistry
-}
-
-// --- Add helper to fetch raw schema data ---
-// (Ensure this or similar logic exists)
-func (l *SchemaLoader) fetchSchemaData(url string) ([]byte, error) {
-	// ... (Implementation as provided before) ...
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("fetching schema from URL %s: %w", url, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP error fetching schema %s: %s", url, resp.Status)
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading schema response from %s: %w", url, err)
-	}
-	return data, nil
 }
