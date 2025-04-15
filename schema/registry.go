@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log" // Import strings
+	"strings"
 	"sync"
 	"time"
 
@@ -135,6 +136,114 @@ func (r *SchemaRegistry) GetEventDefinitions() []messages.EventDefinition {
 	result := make([]messages.EventDefinition, len(r.definitions))
 	copy(result, r.definitions)
 	return result
+}
+
+// GetTopicForEvent returns the Kafka topic for a specific event type
+func (r *SchemaRegistry) GetTopicForEvent(entityType, action string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Look through all event definitions for this entity.action
+	for _, def := range r.definitions {
+		if def.EntityType == entityType && def.Action == action {
+			if def.Topic != "" {
+				return def.Topic, true
+			}
+		}
+	}
+
+	// If no specific definition found or topic is empty, return default
+	return "", false
+}
+
+// GetAllTopics returns all unique Kafka topics for registered event types
+func (r *SchemaRegistry) GetAllTopics() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Use a map to deduplicate topics
+	topicMap := make(map[string]bool)
+
+	for _, def := range r.definitions {
+		if def.Topic != "" {
+			topicMap[def.Topic] = true
+		}
+	}
+
+	// Convert map keys to slice
+	topics := make([]string, 0, len(topicMap))
+	for topic := range topicMap {
+		topics = append(topics, topic)
+	}
+
+	return topics
+}
+
+// GetTopicsForEntityTypes returns all unique Kafka topics for specified entity types
+func (r *SchemaRegistry) GetTopicsForEntityTypes(entityTypes []string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Use a map for entity types lookup (faster than slice iteration)
+	entityTypeMap := make(map[string]bool, len(entityTypes))
+	for _, entityType := range entityTypes {
+		entityTypeMap[entityType] = true
+	}
+
+	// Use a map to deduplicate topics
+	topicMap := make(map[string]bool)
+
+	for _, def := range r.definitions {
+		if _, found := entityTypeMap[def.EntityType]; found && def.Topic != "" {
+			topicMap[def.Topic] = true
+		}
+	}
+
+	// Convert map keys to slice
+	topics := make([]string, 0, len(topicMap))
+	for topic := range topicMap {
+		topics = append(topics, topic)
+	}
+
+	return topics
+}
+
+// GetTopicsForEntityActions returns all unique Kafka topics for specified entity-action pairs
+func (r *SchemaRegistry) GetTopicsForEntityActions(entityActions []string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Use a map to deduplicate topics
+	topicMap := make(map[string]bool)
+
+	// Parse the entity-action pairs (format: "entity.action")
+	for _, entityAction := range entityActions {
+		parts := strings.Split(entityAction, ".")
+		if len(parts) != 2 {
+			log.Printf("Warning: Invalid entity-action format: %s. Expected 'entity.action'", entityAction)
+			continue
+		}
+
+		entityType := parts[0]
+		action := parts[1]
+
+		// Find matching event definition(s)
+		for _, def := range r.definitions {
+			if def.EntityType == entityType && (action == "*" || def.Action == action) {
+				if def.Topic != "" {
+					topicMap[def.Topic] = true
+				}
+			}
+		}
+	}
+
+	// Convert map keys to slice
+	topics := make([]string, 0, len(topicMap))
+	for topic := range topicMap {
+		topics = append(topics, topic)
+	}
+
+	return topics
 }
 
 // Global instance

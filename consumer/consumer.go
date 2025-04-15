@@ -235,14 +235,40 @@ func (c *EventConsumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim 
 
 // processMessage handles a received message
 func (c *EventConsumer) processMessage(ctx context.Context, message *sarama.ConsumerMessage) error {
+	// First extract entity_type and action from headers if available
+	var entityType, action string
+	for _, header := range message.Headers {
+		if string(header.Key) == "entity_type" {
+			entityType = string(header.Value)
+		} else if string(header.Key) == "action" {
+			action = string(header.Value)
+		}
+	}
+
 	// Parse message into BaseEventMessage
 	eventMsg, err := messages.FromJSON(message.Value)
 	if err != nil {
 		return fmt.Errorf("parsing event message: %w", err)
 	}
 
+	// If headers are empty, use values from the payload
+	if entityType == "" {
+		entityType = eventMsg.Entity.Type
+	}
+	if action == "" {
+		action = eventMsg.Action
+	}
+
+	// Override payload values with header values (header values take precedence)
+	// This ensures consistency between headers and the handler lookup
+	eventMsg.Entity.Type = entityType
+	eventMsg.Action = action
+
 	// Get handlers for this event type
-	key := fmt.Sprintf("%s.%s", eventMsg.Entity.Type, eventMsg.Action)
+	key := fmt.Sprintf("%s.%s", entityType, action)
+
+	log.Printf("Processing message: topic=%s, entity_type=%s, action=%s",
+		message.Topic, entityType, action)
 
 	c.mu.Lock()
 	eventHandlers := make([]EventHandler, len(c.handlers[key]))
@@ -252,6 +278,13 @@ func (c *EventConsumer) processMessage(ctx context.Context, message *sarama.Cons
 	topicHandlers := make([]EventHandler, len(c.topicHandlers[message.Topic]))
 	copy(topicHandlers, c.topicHandlers[message.Topic])
 	c.mu.Unlock()
+
+	if len(eventHandlers) == 0 && len(topicHandlers) == 0 {
+		// No handlers for this message, log and skip
+		log.Printf("No handlers found for message: topic=%s, entity_type=%s, action=%s",
+			message.Topic, entityType, action)
+		return nil
+	}
 
 	// Execute event-specific handlers
 	for _, handler := range eventHandlers {

@@ -3,6 +3,7 @@ package goevents
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/google/uuid"
@@ -97,9 +98,6 @@ func (c *EventClient) PublishEvent(
 	// Skip validation when disabled
 	if c.config.SchemaValidation {
 		if err := c.schemaRegistry.ValidatePayload(entity.Type, action, payload); err != nil {
-			// Consider logging the validation error but not returning it,
-			// depending on whether validation failure should block publishing.
-			// For now, return the error.
 			return fmt.Errorf("payload validation failed: %w", err)
 		}
 	}
@@ -114,14 +112,14 @@ func (c *EventClient) PublishEvent(
 	eventMsg := &messages.BaseEventMessage{
 		EventID:       eventID,
 		CorrelationID: correlID,
-		Timestamp:     time.Now().UTC(), // Use UTC time
+		Timestamp:     time.Now().UTC(),
 		Entity: messages.Entity{
 			Type: entity.Type,
 			ID:   entity.ID,
 		},
 		Action: action,
 		Actor: messages.Actor{
-			Type: messages.ActorType(actor.Type), // Ensure conversion to ActorType
+			Type: messages.ActorType(actor.Type),
 			ID:   actor.ID,
 		},
 		Payload: payload,
@@ -133,20 +131,18 @@ func (c *EventClient) PublishEvent(
 		// Try getting topic from schema registry first
 		if eventDef, found := c.schemaRegistry.GetEventDefinition(entity.Type, action); found && eventDef.Topic != "" {
 			topic = eventDef.Topic
+			log.Printf("Using topic '%s' from schema registry for %s.%s", topic, entity.Type, action)
 		} else {
-			// Fallback to default topic prefix from config if schema registry has no info
-			// or if validation is disabled (schema registry might be empty)
-			topic = c.config.KafkaTopicPrefix // <-- Use prefix from config
+			// Fallback to default topic
+			topic = c.config.KafkaTopicPrefix
+			log.Printf("Using default topic prefix '%s' for %s.%s (not found in schema)", topic, entity.Type, action)
 			if topic == "" {
-				// Final fallback if prefix is also empty in config (should not happen with defaults)
 				return fmt.Errorf("no topic specified and no default topic prefix configured for %s.%s", entity.Type, action)
 			}
 		}
 	}
-	// --- End Determine Topic ---
 
 	if topic == "" {
-		// This check is likely redundant now due to the logic above, but keep for safety
 		return fmt.Errorf("could not determine topic for %s.%s", entity.Type, action)
 	}
 
@@ -181,6 +177,13 @@ func (c *EventClient) Start(ctx context.Context) error {
 		return nil
 	}
 
+	// Ensure we have topics from schema if none specified
+	if len(c.config.Kafka.Topics) == 0 {
+		log.Println("No topics configured, fetching from schema registry")
+		c.ConfigureConsumerTopics([]string{})
+	}
+
+	log.Printf("Starting consumer with topics: %v", c.config.Kafka.Topics)
 	return c.consumer.Start(ctx)
 }
 
@@ -200,4 +203,79 @@ func (c *EventClient) Close() error {
 		return producerErr
 	}
 	return consumerErr
+}
+
+// GetTopicForEvent returns the Kafka topic for a specific event type
+func (c *EventClient) GetTopicForEvent(entityType, action string) string {
+	topic, found := c.schemaRegistry.GetTopicForEvent(entityType, action)
+	if !found {
+		// Fallback to default topic prefix if defined
+		if c.config.KafkaTopicPrefix != "" {
+			return c.config.KafkaTopicPrefix
+		}
+		// Last resort fallback
+		return ""
+	}
+	return topic
+}
+
+// ConfigureConsumerTopics updates the Kafka config with topics from the schema registry
+// Keep the original method for backward compatibility
+func (c *EventClient) ConfigureConsumerTopics(entityTypes []string) {
+	// Convert entity types to entity-action wildcards for backward compatibility
+	entityActions := make([]string, len(entityTypes))
+	for i, entityType := range entityTypes {
+		entityActions[i] = entityType + ".*" // Wildcard for all actions
+	}
+
+	c.ConfigureConsumerTopicsForActions(entityActions)
+}
+
+// GetConsumerTopics returns the currently configured Kafka topics
+func (c *EventClient) GetConsumerTopics() []string {
+	return c.config.Kafka.Topics
+}
+
+// ConfigureConsumerTopicsForActions provides precise control over entity-action pairs
+func (c *EventClient) ConfigureConsumerTopicsForActions(entityActions []string) {
+	// Get topics for the specified entity-action pairs
+	var topics []string
+	if len(entityActions) > 0 {
+		topics = c.schemaRegistry.GetTopicsForEntityActions(entityActions)
+	} else {
+		topics = c.schemaRegistry.GetAllTopics()
+	}
+
+	// Ensure we have at least default topic if nothing found
+	if len(topics) == 0 && c.config.KafkaTopicPrefix != "" {
+		topics = []string{c.config.KafkaTopicPrefix}
+	}
+
+	// Update the Kafka config
+	c.config.Kafka.Topics = topics
+
+	log.Printf("Configured consumer to use topics: %v for entity-actions: %v", topics, entityActions)
+}
+
+// EnsureConsumerInitialized makes sure the consumer is initialized with the configured topics
+func (c *EventClient) EnsureConsumerInitialized() error {
+	// If consumer is already initialized, nothing to do
+	if c.consumer != nil {
+		return nil
+	}
+
+	// If no topics configured, can't initialize
+	if len(c.config.Kafka.Topics) == 0 {
+		return fmt.Errorf("cannot initialize consumer: no topics configured")
+	}
+
+	// Create the consumer
+	var err error
+	c.consumer, err = consumer.NewEventConsumer(&c.config.Kafka)
+	if err != nil {
+		return fmt.Errorf("initializing consumer: %w", err)
+	}
+
+	log.Printf("Consumer initialized with topics: %v", c.config.Kafka.Topics)
+	return nil
 }

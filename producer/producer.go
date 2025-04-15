@@ -3,6 +3,7 @@ package producer
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -67,7 +68,15 @@ func (p *EventProducer) Publish(topic string, eventMsg *messages.BaseEventMessag
 	}
 
 	if eventMsg.Timestamp.IsZero() {
-		eventMsg.Timestamp = time.Now()
+		eventMsg.Timestamp = time.Now().UTC()
+	}
+
+	// Validate entity type and action are present
+	if eventMsg.Entity.Type == "" {
+		return fmt.Errorf("entity type cannot be empty")
+	}
+	if eventMsg.Action == "" {
+		return fmt.Errorf("action cannot be empty")
 	}
 
 	// Serialize the message
@@ -86,10 +95,10 @@ func (p *EventProducer) Publish(topic string, eventMsg *messages.BaseEventMessag
 			Key:   []byte("action"),
 			Value: []byte(eventMsg.Action),
 		},
-		{
-			Key:   []byte("event_id"),
-			Value: []byte(eventMsg.EventID),
-		},
+		// {
+		// 	Key:   []byte("event_id"),
+		// 	Value: []byte(eventMsg.EventID),
+		// },
 	}
 
 	// Add correlation ID header if present
@@ -99,6 +108,10 @@ func (p *EventProducer) Publish(topic string, eventMsg *messages.BaseEventMessag
 			Value: []byte(*eventMsg.CorrelationID),
 		})
 	}
+
+	// Log the message details for debugging
+	log.Printf("Publishing message: topic=%s, entity_type=%s, action=%s, event_id=%s",
+		topic, eventMsg.Entity.Type, eventMsg.Action, eventMsg.EventID)
 
 	// Create and send the message
 	msg := &sarama.ProducerMessage{
